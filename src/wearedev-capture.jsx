@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
+import qrCode from "./assets/qr-code.png";
 
 // ─────────────────────────────────────────────
 // PERSONALIZE THIS — the only block you need to edit
@@ -13,6 +14,7 @@ const USER_CONFIG = {
   website: "atharux.com",
   hiringUrl: "hire.atharux.com",
   githubRepo: "https://github.com/atharux/conf-capture",
+  appUrl: "https://conf-capture.pages.dev/",
   writingStyle: `direct, specific, no fluff, problem-reasoning-outcome narrative structure.
 No cringe opener lines. No "Excited to share". No bullet-point lists.
 No em-dashes. No hashtag spam — max 3 hashtags if any.
@@ -1116,26 +1118,26 @@ function AboutTab() {
           ⭐ Star on GitHub
         </a>
 
-        <div
+        <a
+          href={USER_CONFIG.appUrl}
+          target="_blank"
+          rel="noreferrer"
           style={{
+            display: "flex",
             width: 160,
             height: 160,
             backgroundColor: "#1a1a1a",
             border: `1px solid ${COLORS.cardBorder}`,
             borderRadius: 4,
             marginTop: 16,
-            display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            textAlign: "center",
-            color: COLORS.textMuted,
-            fontFamily: FONT_MONO,
-            fontSize: 11,
             padding: 8,
+            boxSizing: "border-box",
           }}
         >
-          QR → github.com/atharux/conf-capture
-        </div>
+          <img src={qrCode} alt="QR code to the live app" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+        </a>
       </div>
 
       <Divider />
