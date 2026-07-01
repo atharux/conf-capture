@@ -1,0 +1,330 @@
+Build a mobile-first, single-file React app (`wearedev-capture.jsx`) saved to `/mnt/user-data/outputs/`. This is an open-source conference companion tool. It is repo-ready and designed to be forked and personalized by anyone.
+
+---
+
+**REPO-READY CONFIG BLOCK — TOP OF FILE, BEFORE ALL OTHER CODE**
+
+Place this config object at the very top of the file, clearly commented as the only thing users need to edit to personalize the app:
+
+```js
+// ─────────────────────────────────────────────
+// PERSONALIZE THIS — the only block you need to edit
+// ─────────────────────────────────────────────
+const USER_CONFIG = {
+  name: "Athar",
+  brand: "Atharux",
+  role: "Developer Advocate & UX Engineer",
+  event: "WeAreDevelopers World Congress",
+  eventLocation: "Berlin",
+  eventYear: "2026",
+  website: "atharux.com",
+  hiringUrl: "hire.atharux.com",
+  githubRepo: "https://github.com/atharux/conf-capture",
+  writingStyle: `direct, specific, no fluff, problem-reasoning-outcome narrative structure.
+No cringe opener lines. No "Excited to share". No bullet-point lists.
+No em-dashes. No hashtag spam — max 3 hashtags if any.
+150–220 words. Punchy and human. Sharp practitioner tone, not content marketer.`,
+};
+// ─────────────────────────────────────────────
+```
+
+All AI prompts, headers, and about screen must reference USER_CONFIG fields — never hardcode name/brand/etc. directly anywhere in the file.
+
+---
+
+**DESIGN SYSTEM — NON-NEGOTIABLE, DO NOT DEVIATE**
+- Background: `#0a0a0a` (near-black)
+- Font: Space Mono for UI labels/metadata, Syne for headings — load both from Google Fonts
+- Primary accent: `#8b5cf6` (purple)
+- Secondary accent: `#06b6d4` (teal)
+- Tertiary accent: `#f97316` (orange) — use for CTAs and post generation actions
+- Record active state: `#ef4444` (red) — mic button while recording
+- Cards: `#111111` background, `1px solid #222222` border
+- All corners: `4px` radius max — brutalist, not rounded
+- Text: `#f5f5f5` primary, `#888888` muted
+- No shadows. No gradients. No frosted glass. Flat and stark.
+- Mobile viewport: design for 390px wide (iPhone-sized), full height
+
+---
+
+**STACK**
+- React with hooks (`useState`, `useRef`, `useCallback`, `useEffect`)
+- Tailwind CDN for layout utilities only — all color/font via inline styles matching design system
+- Anthropic API via `fetch` to `https://api.anthropic.com/v1/messages` — model `claude-sonnet-4-6`, max_tokens 1000
+- Web Audio API + `MediaRecorder` for mic capture — no external STT service
+- No backend. No localStorage. All state in React memory for this session.
+- No form tags. Use `onClick`/`onChange` handlers only.
+
+---
+
+**SHARED MIC COMPONENT — build once, use in Sessions + Contacts**
+
+Build a reusable `<MicCapture>` component with these props:
+- `onTranscript(structuredData)` — callback with parsed JSON from Claude
+- `parsePrompt` — the system prompt string to use for this context (sessions vs contacts)
+- `label` — button label e.g. "Record Session Note" or "Record Voice Note"
+
+Behavior:
+1. Button shows mic icon + label. Tap → requests `getUserMedia({ audio: true })`
+2. If mic permission denied: show inline muted text "Mic unavailable — fill in manually". Do not crash. Do not show error modal.
+3. While recording: button turns red `#ef4444`, pulses, shows "Recording... tap to stop"
+4. On stop: show "Transcribing..." loading state
+5. Encode audio blob as base64
+6. Send to Anthropic API:
+```js
+{
+  model: "claude-sonnet-4-6",
+  max_tokens: 1000,
+  messages: [{
+    role: "user",
+    content: [
+      {
+        type: "document",
+        source: {
+          type: "base64",
+          media_type: audioBlob.type, // e.g. "audio/webm"
+          data: base64AudioData
+        }
+      },
+      {
+        type: "text",
+        text: parsePrompt
+      }
+    ]
+  }]
+}
+```
+7. Parse JSON response → call `onTranscript(parsedData)` → parent pre-fills form fields
+8. If JSON parse fails: show raw transcript text so user can read and fill manually
+9. After transcription: show small "Re-record" link to try again
+
+---
+
+**APP STRUCTURE — 5 VIEWS, TAB-NAVIGATED**
+
+Bottom tab bar with 5 tabs:
+1. **Scan** (camera icon) — 📷
+2. **Sessions** (note icon) — 📝
+3. **Contacts** (people icon) — 👤
+4. **Posts** (lightning icon) — ⚡
+5. **About** (info icon) — ℹ️
+
+---
+
+**TAB 1 — SCAN (Business Card Scanner)**
+
+UI:
+- "SCAN CARD" header
+- Large camera viewfinder area — uses `getUserMedia({ video: true })` to stream device camera
+- "Capture" button (circular, purple `#8b5cf6`) overlaid at bottom of viewfinder
+- Fallback: "Upload photo instead" text link — file input accept="image/*" capture="environment"
+- After capture/upload: show thumbnail + "Parsing card..." loading state
+
+Behavior:
+- Convert image to base64, send to Anthropic API:
+```
+System: You are a business card parser. Extract the following fields from the business card image. Return ONLY a JSON object with no preamble, no markdown, no backticks. Fields: name (string), title (string), company (string), email (string), linkedin (string, if visible), phone (string, if visible). If a field is not visible, return an empty string for that field.
+```
+- Parse JSON → pre-fill editable form:
+  - Name, Title, Company, Email, LinkedIn (optional), Phone (optional), Notes (free text)
+- "Save Contact" button (teal) → saves to contacts state
+- "Scan Another" resets view
+- If JSON parse fails: show raw API response as text, all fields blank for manual entry
+
+---
+
+**TAB 2 — SESSIONS (Workshop/Talk Logger)**
+
+UI:
+- "SESSIONS" header
+- "Log Session" button (orange) at top right
+- Session list, reverse chronological, below
+
+Log Session — inline expanded form (not a modal):
+
+At the TOP of the form, before any text fields:
+
+```
+<MicCapture
+  label="Record Session Note"
+  parsePrompt={SESSION_PARSE_PROMPT}
+  onTranscript={(data) => pre-fill all session fields from data}
+/>
+```
+
+SESSION_PARSE_PROMPT:
+```
+The user has recorded a voice note about a conference session they just attended. Extract and return ONLY a JSON object with no preamble, no markdown, no backticks. Fields: sessionTitle (string), speaker (string), day (string — one of: "Wed", "Thu", "Fri", or empty string), timeSlot (string), keyInsight (string — the most useful thing they mentioned), quoteStat (string — any quote or statistic mentioned), actionItem (string — anything they said they'd do next), rating (number 1-5, infer from sentiment if not stated explicitly, default 3).
+```
+
+Text fields below the mic (pre-filled by voice, editable):
+- Session title
+- Speaker name
+- Day (segmented tap: Wed / Thu / Fri)
+- Time slot
+- Key insight (textarea)
+- Quote or stat (textarea)
+- Action item (textarea)
+- Rating (1–5 star tap selector, purple)
+- "Save Session" button (teal)
+
+Session card: title, speaker, day+time, stars, truncated insight. Tap to expand.
+
+---
+
+**TAB 3 — CONTACTS (Parsed Card Log)**
+
+UI:
+- "CONTACTS" header
+- Contact list, reverse chronological
+
+Each contact card: name (large), title + company (muted), email, notes preview. Tap to expand full detail.
+
+Expanded contact card has:
+- All fields displayed
+- "Generate Post" button (orange) → switches to Posts tab with contact pre-loaded
+- "Add Voice Note" button (teal) → opens inline `<MicCapture>` below the card
+
+CONTACT_VOICE_PARSE_PROMPT:
+```
+The user has recorded a voice note about someone they just met at a conference. Extract and return ONLY a JSON object with no preamble, no markdown, no backticks. Fields: additionalNotes (string — any new context about this person), followUp (string — any follow-up action mentioned), connectionStrength (string — one of: "strong", "medium", "light", infer from tone).
+```
+
+On transcript: append additionalNotes and followUp to existing contact record. Show updated card.
+
+---
+
+**TAB 4 — POSTS (LinkedIn Post Generator)**
+
+UI:
+- "POSTS" header
+- Context selector (segmented or dropdown):
+  - "From contact" → dropdown of saved contacts by name
+  - "From session" → dropdown of saved sessions by title
+  - "General reflection" → no context
+- Post type selector (tap chips):
+  - "Met someone interesting"
+  - "Workshop takeaway"
+  - "Hot take / observation"
+  - "Day recap"
+
+At top of this tab, above context selector:
+
+```
+<MicCapture
+  label="Record Post Idea"
+  parsePrompt={POST_IDEA_PROMPT}
+  onTranscript={(data) => pre-fill post idea field}
+/>
+```
+
+POST_IDEA_PROMPT:
+```
+The user has recorded a rough idea for a LinkedIn post. Extract and return ONLY a JSON object with no preamble, no markdown, no backticks. Fields: rawIdea (string — their core point or observation, cleaned up but not polished), suggestedPostType (string — one of: "Met someone interesting", "Workshop takeaway", "Hot take / observation", "Day recap").
+```
+
+- Raw idea textarea (pre-filled from voice or typed manually) — labeled "Your rough idea or talking point"
+- "Generate Post" button (orange)
+- Generated post in dark editable textarea
+- "Copy to clipboard" button (teal)
+- "Regenerate" button (purple)
+- Post history: last 5 posts as collapsed cards
+
+Post generation system prompt — built dynamically from USER_CONFIG:
+```
+You are writing a LinkedIn post for ${USER_CONFIG.name}, a ${USER_CONFIG.role} currently at ${USER_CONFIG.event} in ${USER_CONFIG.eventLocation} (${USER_CONFIG.eventYear}). Their brand is ${USER_CONFIG.brand}. Writing style: ${USER_CONFIG.writingStyle}. Write in first person. Return only the post text. No preamble. No explanation.
+
+Context: [inject selected contact or session JSON, or raw idea if general]
+Post type: [inject selected post type]
+```
+
+---
+
+**TAB 5 — ABOUT**
+
+Static screen, no API calls. All content from USER_CONFIG.
+
+Layout top to bottom:
+- App name: "CONF CAPTURE" — Syne, large, purple
+- Tagline (Space Mono, muted): "Scan cards. Log sessions. Record notes. Post while it's fresh."
+- Divider `#222`
+- Built by:
+  - `{USER_CONFIG.brand}` — purple, Space Mono
+  - `{USER_CONFIG.role}` — muted
+  - `{USER_CONFIG.website}` — teal tappable link
+  - `{USER_CONFIG.hiringUrl}` — teal tappable link, labeled "Available for roles →"
+- Divider
+- "GET THE APP" section:
+  - Muted instruction: "Open-source. Fork it, edit the config block, use it at your next conference."
+  - "⭐ Star on GitHub" — teal outlined button, links to `{USER_CONFIG.githubRepo}`
+  - QR placeholder: `#1a1a1a` bordered box 160×160px, centered, muted text: "QR → github.com/atharux/conf-capture" — user replaces with real QR image after repo is live
+- Divider
+- "SETUP →" collapsible section (collapsed by default):
+  When expanded, show in Space Mono small muted text like terminal output:
+  ```
+  1. clone {USER_CONFIG.githubRepo}
+  2. edit USER_CONFIG at top of wearedev-capture.jsx
+  3. open in browser or deploy to Vercel / Netlify
+  4. enter Anthropic API key on first load
+  5. bring to your next conference
+  ```
+- Bottom stamp (tiny, muted): "v1.0 · Built in one day · MIT License"
+
+---
+
+**API KEY HANDLING**
+
+- On first load: if no key set, show minimal centered modal over dark overlay:
+  - "ANTHROPIC API KEY" — Space Mono header
+  - Muted instruction: "Required for card scanning, voice transcription, and post generation. Stored in session memory only — never saved."
+  - Password input
+  - "Save for session" button (purple)
+  - "Get a key →" teal link to `https://console.anthropic.com`
+- Key stored in React state only. Used as `x-api-key` header on all fetch calls.
+- Top-right indicator: 🔑 if set, ⚠️ if not. Tap ⚠️ to re-open the key modal.
+
+---
+
+**GLOBAL HEADER**
+
+Thin fixed top bar:
+- Left: `{USER_CONFIG.brand}` — Space Mono, small, `#888888`
+- Center: `{USER_CONFIG.event} '26` — Syne, `#8b5cf6`
+- Right: API key indicator (tap to manage)
+
+---
+
+**ERROR HANDLING**
+- All API calls: try/catch, show inline red `#ef4444` error text — never crash
+- Camera unavailable: auto-show file upload fallback, no modal
+- Mic unavailable: show "Mic unavailable — fill in manually", no modal
+- JSON parse fail (card): show raw text, blank fields for manual entry
+- JSON parse fail (audio): show raw transcript text so user can read and fill manually
+- Network error: "Check your connection and try again" inline
+
+---
+
+**OUTPUT CONTRACT**
+- Single file: `wearedev-capture.jsx`
+- Complete — no placeholders, no TODOs, no "add your logic here"
+- USER_CONFIG is the first substantive code in the file
+- MicCapture is a single reusable component used in Sessions, Contacts, and Posts
+- Saved to `/mnt/user-data/outputs/wearedev-capture.jsx`
+- Return the full file. Do not summarize or snippet.
+
+---
+
+**REGRESSION CONTRACT**
+Before returning the file, verify internally:
+- USER_CONFIG at top — no hardcoded personal strings anywhere else
+- All 5 tabs present and navigable
+- MicCapture component built once, used in Sessions + Contacts + Posts
+- Camera capture + file upload fallback both implemented in Scan tab
+- Mic record → Claude transcription → field pre-fill working in Sessions, Contacts, Posts
+- About tab: GitHub button, QR placeholder, collapsible setup instructions, all from USER_CONFIG
+- API key modal on first load, tap-to-manage from header
+- Design tokens match spec exactly — red for active recording state
+- No form tags anywhere
+- React-only state — no localStorage
+
+Then state: "This file is complete, verified, and safe to use."
