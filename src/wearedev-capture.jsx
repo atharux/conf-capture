@@ -225,11 +225,12 @@ async function callOpenRouterWithFallback(apiKey, modelList, { systemPrompt, use
     throw new Error("No free models available right now. Try again shortly.");
   }
   for (const modelId of modelList) {
+    let response;
     try {
       const messages = [];
       if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
       messages.push({ role: "user", content: userContent });
-      const response = await fetch(OPENROUTER_CHAT_URL, {
+      response = await fetch(OPENROUTER_CHAT_URL, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -239,14 +240,24 @@ async function callOpenRouterWithFallback(apiKey, modelList, { systemPrompt, use
         },
         body: JSON.stringify({ model: modelId, max_tokens: MAX_TOKENS, messages }),
       });
-      if (!response.ok) continue;
-      const result = await response.json();
-      const text = result && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content;
-      if (!text) continue;
-      return { text, meta: extractMeta(result) };
-    } catch (err) {
+    } catch (networkErr) {
+      continue; // transient network hiccup — try the next model
+    }
+    // A bad key fails identically on every model — no point burning through
+    // the whole list before telling the user what's actually wrong.
+    if (response.status === 401 || response.status === 403) {
+      throw new Error("Invalid OpenRouter API key — check it and try again.");
+    }
+    if (!response.ok) continue;
+    let result;
+    try {
+      result = await response.json();
+    } catch (parseErr) {
       continue;
     }
+    const text = result && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content;
+    if (!text) continue;
+    return { text, meta: extractMeta(result) };
   }
   throw new Error("All free models are unavailable right now — try again shortly, or switch to an Anthropic key.");
 }
@@ -429,6 +440,25 @@ function MicCapture({ apiKey, provider, label, parsePrompt, onTranscript }) {
   const chunksRef = useRef([]);
   const streamRef = useRef(null);
 
+  // Release the mic if the component unmounts mid-recording (tab switch, form
+  // close, switching which contact's voice note is open) — otherwise the
+  // stream stays open and the browser's recording indicator never clears.
+  useEffect(() => {
+    return () => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        try {
+          mediaRecorderRef.current.stop();
+        } catch (e) {
+          // no-op — recorder already stopped
+        }
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+    };
+  }, []);
+
   if (provider === "openrouter") {
     return (
       <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13 }}>
@@ -588,6 +618,7 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
   const streamRef = useRef(null);
+  const busyRef = useRef(false); // guards against a second capture/upload racing an in-flight scan
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState(false);
   const [thumbnail, setThumbnail] = useState(null);
@@ -595,6 +626,7 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
   const [errorMsg, setErrorMsg] = useState("");
   const [rawText, setRawText] = useState("");
   const [meta, setMeta] = useState(null);
+  const [saveError, setSaveError] = useState("");
   const emptyForm = { name: "", title: "", company: "", email: "", linkedin: "", phone: "", notes: "" };
   const [form, setForm] = useState(emptyForm);
   const [savedFlash, setSavedFlash] = useState(false);
@@ -631,6 +663,8 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
   const updateField = (key, val) => setForm((prev) => ({ ...prev, [key]: val }));
 
   const processImage = async (blob) => {
+    if (busyRef.current) return; // ignore a second capture/upload while one is still in flight
+    busyRef.current = true;
     setThumbnail(URL.createObjectURL(blob));
     setStatus("parsing");
     setErrorMsg("");
@@ -665,16 +699,19 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
     } catch (err) {
       setErrorMsg(err.message || "Something went wrong.");
       setStatus("error");
+    } finally {
+      busyRef.current = false;
     }
   };
 
   const handleFileUpload = (e) => {
     const file = e.target.files && e.target.files[0];
-    if (file) processImage(file);
+    if (file && !busyRef.current) processImage(file);
     e.target.value = "";
   };
 
   const captureFrame = () => {
+    if (busyRef.current) return;
     if (!videoRef.current || !canvasRef.current) return;
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -692,12 +729,17 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
     setForm(emptyForm);
     setRawText("");
     setErrorMsg("");
+    setSaveError("");
     setMeta(null);
     setStatus("idle");
   };
 
   const saveContact = () => {
-    if (!form.name && !form.email) return;
+    if (!form.name.trim() && !form.email.trim()) {
+      setSaveError("Add at least a name or email before saving.");
+      return;
+    }
+    setSaveError("");
     onSaveContact({ ...form, id: Date.now() });
     setSavedFlash(true);
     setTimeout(() => setSavedFlash(false), 1500);
@@ -804,6 +846,7 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
             <button onClick={saveContact} style={primaryButtonStyle(COLORS.teal)}>Save Contact</button>
             <button onClick={resetScan} style={secondaryButtonStyle}>Scan Another</button>
           </div>
+          {saveError && <div style={{ color: COLORS.red, fontFamily: FONT_MONO, fontSize: 12 }}>{saveError}</div>}
           {savedFlash && <div style={{ color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12 }}>Saved.</div>}
         </div>
       )}
@@ -844,6 +887,7 @@ function SessionsTab({ apiKey, provider, sessions, onSaveSession }) {
   const emptyForm = { sessionTitle: "", speaker: "", day: "", timeSlot: "", keyInsight: "", quoteStat: "", actionItem: "", rating: 3 };
   const [form, setForm] = useState(emptyForm);
   const [expandedId, setExpandedId] = useState(null);
+  const [formError, setFormError] = useState("");
 
   const updateField = (key, val) => setForm((prev) => ({ ...prev, [key]: val }));
 
@@ -861,7 +905,11 @@ function SessionsTab({ apiKey, provider, sessions, onSaveSession }) {
   };
 
   const saveSession = () => {
-    if (!form.sessionTitle) return;
+    if (!form.sessionTitle.trim()) {
+      setFormError("Session title is required.");
+      return;
+    }
+    setFormError("");
     onSaveSession({ ...form, id: Date.now() });
     setForm(emptyForm);
     setFormOpen(false);
@@ -871,7 +919,13 @@ function SessionsTab({ apiKey, provider, sessions, onSaveSession }) {
     <div style={{ padding: 16 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <h1 style={headerTextStyle}>SESSIONS</h1>
-        <button onClick={() => setFormOpen((v) => !v)} style={{ ...primaryButtonStyle(COLORS.orange), flex: "none", padding: "8px 14px" }}>
+        <button
+          onClick={() => {
+            setFormOpen((v) => !v);
+            setFormError("");
+          }}
+          style={{ ...primaryButtonStyle(COLORS.orange), flex: "none", padding: "8px 14px" }}
+        >
           {formOpen ? "Close" : "Log Session"}
         </button>
       </div>
@@ -918,6 +972,7 @@ function SessionsTab({ apiKey, provider, sessions, onSaveSession }) {
             <StarRating value={form.rating} onChange={(v) => updateField("rating", v)} />
           </div>
 
+          {formError && <div style={{ color: COLORS.red, fontFamily: FONT_MONO, fontSize: 12 }}>{formError}</div>}
           <button onClick={saveSession} style={primaryButtonStyle(COLORS.teal)}>Save Session</button>
         </div>
       )}
@@ -1024,6 +1079,9 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
       setContextType("contact");
       setSelectedContactId(String(presetContact.id));
       setPostType("Met someone interesting");
+      setGenerated("");
+      setMeta(null);
+      setErrorMsg("");
       clearPreset();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1047,6 +1105,15 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
   };
 
   const generatePost = async () => {
+    if (status === "generating") return; // ignore overlapping taps (e.g. rapid Regenerate)
+    if (contextType === "contact" && !selectedContactId) {
+      setErrorMsg("Select a contact first.");
+      return;
+    }
+    if (contextType === "session" && !selectedSessionId) {
+      setErrorMsg("Select a session first.");
+      return;
+    }
     setStatus("generating");
     setErrorMsg("");
     try {
@@ -1184,7 +1251,9 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
           />
           <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
             <button onClick={copyToClipboard} style={primaryButtonStyle(COLORS.teal)}>Copy to clipboard</button>
-            <button onClick={generatePost} style={primaryButtonStyle(COLORS.purple)}>Regenerate</button>
+            <button onClick={generatePost} disabled={status === "generating"} style={{ ...primaryButtonStyle(COLORS.purple), opacity: status === "generating" ? 0.6 : 1 }}>
+              {status === "generating" ? "Generating..." : "Regenerate"}
+            </button>
           </div>
           {copyFlash && <div style={{ color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6 }}>Copied.</div>}
           <ModelMeta meta={meta} />
