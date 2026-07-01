@@ -36,8 +36,36 @@ const COLORS = {
 };
 const FONT_MONO = "'Space Mono', monospace";
 const FONT_DISPLAY = "'Syne', sans-serif";
-const MODEL = "claude-sonnet-4-6";
+const ANTHROPIC_MODEL = "claude-sonnet-4-6";
 const MAX_TOKENS = 1000;
+const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
+const OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
+
+// Anthropic has full multimodal support (image + audio) on one key.
+// OpenRouter's free tier covers text + card scanning only — no free model
+// reliably handles raw audio, so voice notes stay Anthropic-only.
+const PROVIDER_INFO = {
+  anthropic: {
+    label: "Anthropic",
+    keyPlaceholder: "sk-ant-...",
+    getKeyUrl: "https://console.anthropic.com",
+    capabilities: [
+      { ok: true, text: "Card scanning" },
+      { ok: true, text: "Voice notes" },
+      { ok: true, text: "Post generation" },
+    ],
+  },
+  openrouter: {
+    label: "OpenRouter (Free)",
+    keyPlaceholder: "sk-or-...",
+    getKeyUrl: "https://openrouter.ai/keys",
+    capabilities: [
+      { ok: true, text: "Card scanning" },
+      { ok: false, text: "Voice notes — type your notes instead" },
+      { ok: true, text: "Post generation" },
+    ],
+  },
+};
 
 // ── Prompts ─────────────────────────────────────────────────────
 const CARD_PARSE_SYSTEM_PROMPT =
@@ -160,6 +188,105 @@ function extractResponseText(result) {
   return block ? block.text : "";
 }
 
+// Works for both Anthropic (input_tokens/output_tokens) and OpenAI-style
+// (prompt_tokens/completion_tokens) response shapes.
+function extractMeta(result) {
+  const usage = result && result.usage;
+  return {
+    model: (result && result.model) || "",
+    inputTokens: usage ? (usage.input_tokens != null ? usage.input_tokens : usage.prompt_tokens) : null,
+    outputTokens: usage ? (usage.output_tokens != null ? usage.output_tokens : usage.completion_tokens) : null,
+  };
+}
+
+// Live-fetches OpenRouter's current free models rather than hardcoding IDs —
+// free models get deprecated/renamed often, hardcoded IDs go stale.
+async function fetchFreeOpenRouterModels() {
+  try {
+    const response = await fetch(OPENROUTER_MODELS_URL);
+    if (!response.ok) return { text: [], vision: [] };
+    const data = await response.json();
+    const all = (data && data.data) || [];
+    const free = all.filter((m) => m.pricing && m.pricing.prompt === "0" && m.pricing.completion === "0");
+    const hasModality = (m, mod) => m.architecture && Array.isArray(m.architecture.input_modalities) && m.architecture.input_modalities.includes(mod);
+    const vision = free.filter((m) => hasModality(m, "image")).map((m) => m.id).slice(0, 6);
+    const text = free.filter((m) => hasModality(m, "text") && !hasModality(m, "image")).map((m) => m.id).slice(0, 6);
+    return { text, vision };
+  } catch (err) {
+    return { text: [], vision: [] };
+  }
+}
+
+// Tries each free model in order and moves to the next on failure, so a single
+// deprecated/rate-limited model never surfaces as a user-facing error.
+async function callOpenRouterWithFallback(apiKey, modelList, { systemPrompt, userContent }) {
+  if (!apiKey) throw new Error("No API key set.");
+  if (!modelList || modelList.length === 0) {
+    throw new Error("No free models available right now. Try again shortly.");
+  }
+  for (const modelId of modelList) {
+    try {
+      const messages = [];
+      if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
+      messages.push({ role: "user", content: userContent });
+      const response = await fetch(OPENROUTER_CHAT_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+          "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "",
+          "X-Title": USER_CONFIG.brand,
+        },
+        body: JSON.stringify({ model: modelId, max_tokens: MAX_TOKENS, messages }),
+      });
+      if (!response.ok) continue;
+      const result = await response.json();
+      const text = result && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content;
+      if (!text) continue;
+      return { text, meta: extractMeta(result) };
+    } catch (err) {
+      continue;
+    }
+  }
+  throw new Error("All free models are unavailable right now — try again shortly, or switch to an Anthropic key.");
+}
+
+async function generateFromImage({ provider, apiKey, openrouterModels, systemPrompt, imageBase64, mediaType }) {
+  if (provider === "openrouter") {
+    let models = openrouterModels && openrouterModels.vision;
+    if (!models || models.length === 0) models = (await fetchFreeOpenRouterModels()).vision;
+    const userContent = [
+      { type: "image_url", image_url: { url: `data:${mediaType};base64,${imageBase64}` } },
+      { type: "text", text: "Extract the fields now." },
+    ];
+    return callOpenRouterWithFallback(apiKey, models, { systemPrompt, userContent });
+  }
+  const body = {
+    model: ANTHROPIC_MODEL,
+    max_tokens: MAX_TOKENS,
+    system: systemPrompt,
+    messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: mediaType, data: imageBase64 } }] }],
+  };
+  const result = await callAnthropic(apiKey, body);
+  return { text: extractResponseText(result), meta: extractMeta(result) };
+}
+
+async function generateFromText({ provider, apiKey, openrouterModels, systemPrompt, userText }) {
+  if (provider === "openrouter") {
+    let models = openrouterModels && openrouterModels.text;
+    if (!models || models.length === 0) models = (await fetchFreeOpenRouterModels()).text;
+    return callOpenRouterWithFallback(apiKey, models, { systemPrompt, userContent: userText });
+  }
+  const body = {
+    model: ANTHROPIC_MODEL,
+    max_tokens: MAX_TOKENS,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userText }],
+  };
+  const result = await callAnthropic(apiKey, body);
+  return { text: extractResponseText(result), meta: extractMeta(result) };
+}
+
 function tryParseJSON(text) {
   try {
     const cleaned = text.trim().replace(/^```(json)?/i, "").replace(/```$/, "").trim();
@@ -278,14 +405,37 @@ function Divider() {
   return <div style={{ height: 1, backgroundColor: COLORS.cardBorder, margin: "16px 0" }} />;
 }
 
+function ModelMeta({ meta }) {
+  if (!meta || !meta.model) return null;
+  const shortModel = meta.model.split("/").pop();
+  const hasTokens = meta.inputTokens != null && meta.outputTokens != null;
+  return (
+    <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 10, marginTop: 6 }}>
+      via {shortModel}
+      {hasTokens ? ` · ${meta.inputTokens}→${meta.outputTokens} tok` : ""}
+    </div>
+  );
+}
+
 // ── MicCapture — shared across Sessions, Contacts, Posts ───────
-function MicCapture({ apiKey, label, parsePrompt, onTranscript }) {
+// Anthropic-only: no free OpenRouter model reliably handles raw audio, and we'd
+// rather not offer a feature likely to fail than offer it with a shaky fallback.
+function MicCapture({ apiKey, provider, label, parsePrompt, onTranscript }) {
   const [status, setStatus] = useState("idle"); // idle | recording | transcribing | denied | error | done
   const [rawText, setRawText] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
+  const [meta, setMeta] = useState(null);
   const mediaRecorderRef = useRef(null);
   const chunksRef = useRef([]);
   const streamRef = useRef(null);
+
+  if (provider === "openrouter") {
+    return (
+      <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13 }}>
+        Voice notes need an Anthropic key — type your note below.
+      </div>
+    );
+  }
 
   const cleanupStream = () => {
     if (streamRef.current) {
@@ -299,7 +449,7 @@ function MicCapture({ apiKey, label, parsePrompt, onTranscript }) {
       const blob = new Blob(chunksRef.current, { type: mimeType });
       const base64Data = await blobToBase64(blob);
       const body = {
-        model: MODEL,
+        model: ANTHROPIC_MODEL,
         max_tokens: MAX_TOKENS,
         messages: [
           {
@@ -323,6 +473,7 @@ function MicCapture({ apiKey, label, parsePrompt, onTranscript }) {
       } else {
         setRawText(parsed.raw);
       }
+      setMeta(extractMeta(result));
       setStatus("done");
     } catch (err) {
       setErrorMsg(err.message || "Something went wrong while transcribing.");
@@ -370,6 +521,7 @@ function MicCapture({ apiKey, label, parsePrompt, onTranscript }) {
     setStatus("idle");
     setRawText("");
     setErrorMsg("");
+    setMeta(null);
   };
 
   if (status === "denied") {
@@ -416,19 +568,22 @@ function MicCapture({ apiKey, label, parsePrompt, onTranscript }) {
       )}
 
       {status === "done" && (
-        <button
-          onClick={reset}
-          style={{ background: "none", border: "none", color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6, cursor: "pointer", padding: 0 }}
-        >
-          Re-record
-        </button>
+        <>
+          <ModelMeta meta={meta} />
+          <button
+            onClick={reset}
+            style={{ background: "none", border: "none", color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6, cursor: "pointer", padding: 0 }}
+          >
+            Re-record
+          </button>
+        </>
       )}
     </div>
   );
 }
 
 // ── TAB 1 — Scan ─────────────────────────────────────────────
-function ScanTab({ apiKey, onSaveContact }) {
+function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -439,6 +594,7 @@ function ScanTab({ apiKey, onSaveContact }) {
   const [status, setStatus] = useState("idle"); // idle | parsing | error
   const [errorMsg, setErrorMsg] = useState("");
   const [rawText, setRawText] = useState("");
+  const [meta, setMeta] = useState(null);
   const emptyForm = { name: "", title: "", company: "", email: "", linkedin: "", phone: "", notes: "" };
   const [form, setForm] = useState(emptyForm);
   const [savedFlash, setSavedFlash] = useState(false);
@@ -481,21 +637,15 @@ function ScanTab({ apiKey, onSaveContact }) {
     setRawText("");
     try {
       const base64Data = await blobToBase64(blob);
-      const body = {
-        model: MODEL,
-        max_tokens: MAX_TOKENS,
-        system: CARD_PARSE_SYSTEM_PROMPT,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "image", source: { type: "base64", media_type: blob.type || "image/jpeg", data: base64Data } },
-            ],
-          },
-        ],
-      };
-      const result = await callAnthropic(apiKey, body);
-      const text = extractResponseText(result);
+      const { text, meta: responseMeta } = await generateFromImage({
+        provider,
+        apiKey,
+        openrouterModels,
+        systemPrompt: CARD_PARSE_SYSTEM_PROMPT,
+        imageBase64: base64Data,
+        mediaType: blob.type || "image/jpeg",
+      });
+      setMeta(responseMeta);
       const parsed = tryParseJSON(text);
       if (parsed.ok) {
         setForm({
@@ -542,6 +692,7 @@ function ScanTab({ apiKey, onSaveContact }) {
     setForm(emptyForm);
     setRawText("");
     setErrorMsg("");
+    setMeta(null);
     setStatus("idle");
   };
 
@@ -626,6 +777,7 @@ function ScanTab({ apiKey, onSaveContact }) {
         <div style={{ marginTop: 16 }}>
           <img src={thumbnail} alt="Captured card" style={{ width: "100%", borderRadius: 4, border: `1px solid ${COLORS.cardBorder}` }} />
           {status === "parsing" && <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13, marginTop: 8 }}>Parsing card...</div>}
+          {status !== "parsing" && <ModelMeta meta={meta} />}
         </div>
       )}
 
@@ -687,7 +839,7 @@ function SessionCard({ session, expanded, onToggle }) {
   );
 }
 
-function SessionsTab({ apiKey, sessions, onSaveSession }) {
+function SessionsTab({ apiKey, provider, sessions, onSaveSession }) {
   const [formOpen, setFormOpen] = useState(false);
   const emptyForm = { sessionTitle: "", speaker: "", day: "", timeSlot: "", keyInsight: "", quoteStat: "", actionItem: "", rating: 3 };
   const [form, setForm] = useState(emptyForm);
@@ -726,7 +878,7 @@ function SessionsTab({ apiKey, sessions, onSaveSession }) {
 
       {formOpen && (
         <div style={{ marginTop: 16, padding: 14, backgroundColor: COLORS.card, border: `1px solid ${COLORS.cardBorder}`, borderRadius: 4, display: "flex", flexDirection: "column", gap: 12 }}>
-          <MicCapture apiKey={apiKey} label="Record Session Note" parsePrompt={SESSION_PARSE_PROMPT} onTranscript={handleTranscript} />
+          <MicCapture apiKey={apiKey} provider={provider} label="Record Session Note" parsePrompt={SESSION_PARSE_PROMPT} onTranscript={handleTranscript} />
 
           <LabeledInput label="Session title" value={form.sessionTitle} onChange={(v) => updateField("sessionTitle", v)} />
           <LabeledInput label="Speaker" value={form.speaker} onChange={(v) => updateField("speaker", v)} />
@@ -781,7 +933,7 @@ function SessionsTab({ apiKey, sessions, onSaveSession }) {
 }
 
 // ── TAB 3 — Contacts ─────────────────────────────────────────
-function ContactsTab({ apiKey, contacts, onUpdateContact, onGeneratePost }) {
+function ContactsTab({ apiKey, provider, contacts, onUpdateContact, onGeneratePost }) {
   const [expandedId, setExpandedId] = useState(null);
   const [voiceOpenId, setVoiceOpenId] = useState(null);
 
@@ -837,6 +989,7 @@ function ContactsTab({ apiKey, contacts, onUpdateContact, onGeneratePost }) {
                   <div style={{ marginTop: 10 }}>
                     <MicCapture
                       apiKey={apiKey}
+                      provider={provider}
                       label="Record Voice Note"
                       parsePrompt={CONTACT_VOICE_PARSE_PROMPT}
                       onTranscript={(data) => handleVoiceTranscript(c, data)}
@@ -854,7 +1007,7 @@ function ContactsTab({ apiKey, contacts, onUpdateContact, onGeneratePost }) {
 }
 
 // ── TAB 4 — Posts ─────────────────────────────────────────────
-function PostsTab({ apiKey, contacts, sessions, posts, onAddPost, presetContact, clearPreset }) {
+function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, posts, onAddPost, presetContact, clearPreset }) {
   const [contextType, setContextType] = useState("general"); // contact | session | general
   const [selectedContactId, setSelectedContactId] = useState("");
   const [selectedSessionId, setSelectedSessionId] = useState("");
@@ -864,6 +1017,7 @@ function PostsTab({ apiKey, contacts, sessions, posts, onAddPost, presetContact,
   const [status, setStatus] = useState("idle"); // idle | generating | error
   const [errorMsg, setErrorMsg] = useState("");
   const [copyFlash, setCopyFlash] = useState(false);
+  const [meta, setMeta] = useState(null);
 
   useEffect(() => {
     if (presetContact) {
@@ -897,15 +1051,11 @@ function PostsTab({ apiKey, contacts, sessions, posts, onAddPost, presetContact,
     setErrorMsg("");
     try {
       const systemPrompt = buildPostGenerationPrompt(buildContextJSON(), postType);
-      const body = {
-        model: MODEL,
-        max_tokens: MAX_TOKENS,
-        system: systemPrompt,
-        messages: [{ role: "user", content: rawIdea ? `My rough idea: ${rawIdea}` : "Generate the post now." }],
-      };
-      const result = await callAnthropic(apiKey, body);
-      const text = extractResponseText(result).trim();
+      const userText = rawIdea ? `My rough idea: ${rawIdea}` : "Generate the post now.";
+      const { text: raw, meta: responseMeta } = await generateFromText({ provider, apiKey, openrouterModels, systemPrompt, userText });
+      const text = raw.trim();
       setGenerated(text);
+      setMeta(responseMeta);
       onAddPost({ id: Date.now(), text, postType, contextType });
       setStatus("idle");
     } catch (err) {
@@ -925,7 +1075,7 @@ function PostsTab({ apiKey, contacts, sessions, posts, onAddPost, presetContact,
       <h1 style={headerTextStyle}>POSTS</h1>
 
       <div style={{ marginTop: 16 }}>
-        <MicCapture apiKey={apiKey} label="Record Post Idea" parsePrompt={POST_IDEA_PROMPT} onTranscript={handleIdeaTranscript} />
+        <MicCapture apiKey={apiKey} provider={provider} label="Record Post Idea" parsePrompt={POST_IDEA_PROMPT} onTranscript={handleIdeaTranscript} />
       </div>
 
       <div style={{ marginTop: 12 }}>
@@ -1037,6 +1187,7 @@ function PostsTab({ apiKey, contacts, sessions, posts, onAddPost, presetContact,
             <button onClick={generatePost} style={primaryButtonStyle(COLORS.purple)}>Regenerate</button>
           </div>
           {copyFlash && <div style={{ color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6 }}>Copied.</div>}
+          <ModelMeta meta={meta} />
         </div>
       )}
 
@@ -1099,24 +1250,42 @@ function AboutTab() {
         <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12 }}>
           Open-source. Fork it, edit the config block, use it at your next conference.
         </div>
-        <a
-          href={USER_CONFIG.githubRepo}
-          target="_blank"
-          rel="noreferrer"
-          style={{
-            display: "inline-block",
-            marginTop: 10,
-            padding: "10px 16px",
-            borderRadius: 4,
-            border: `1px solid ${COLORS.teal}`,
-            color: COLORS.teal,
-            fontFamily: FONT_MONO,
-            fontSize: 13,
-            textDecoration: "none",
-          }}
-        >
-          ⭐ Star on GitHub
-        </a>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}>
+          <a
+            href={USER_CONFIG.githubRepo}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              display: "inline-block",
+              padding: "10px 16px",
+              borderRadius: 4,
+              border: `1px solid ${COLORS.teal}`,
+              color: COLORS.teal,
+              fontFamily: FONT_MONO,
+              fontSize: 13,
+              textDecoration: "none",
+            }}
+          >
+            ⭐ Star on GitHub
+          </a>
+          <a
+            href={`${USER_CONFIG.githubRepo}/issues/new`}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              display: "inline-block",
+              padding: "10px 16px",
+              borderRadius: 4,
+              border: `1px solid ${COLORS.orange}`,
+              color: COLORS.orange,
+              fontFamily: FONT_MONO,
+              fontSize: 13,
+              textDecoration: "none",
+            }}
+          >
+            💬 Send Feedback
+          </a>
+        </div>
 
         <a
           href={USER_CONFIG.appUrl}
@@ -1166,7 +1335,7 @@ function AboutTab() {
 {`1. clone ${USER_CONFIG.githubRepo}
 2. edit USER_CONFIG at top of wearedev-capture.jsx
 3. open in browser or deploy to Vercel / Netlify
-4. enter Anthropic API key on first load
+4. on first load, pick Anthropic (full features) or OpenRouter (free — no voice notes)
 5. bring to your next conference`}
           </pre>
         )}
@@ -1182,20 +1351,60 @@ function AboutTab() {
 }
 
 // ── API key modal ────────────────────────────────────────────
-function ApiKeyModal({ onSave, onClose, canClose }) {
+function ApiKeyModal({ provider, onProviderChange, onSave, onClose, canClose }) {
   const [value, setValue] = useState("");
+  const info = PROVIDER_INFO[provider];
+
+  const selectProvider = (key) => {
+    onProviderChange(key);
+    setValue("");
+  };
+
   return (
     <div style={{ position: "fixed", inset: 0, backgroundColor: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 20 }}>
       <div style={{ backgroundColor: COLORS.card, border: `1px solid ${COLORS.cardBorder}`, borderRadius: 4, padding: 20, width: "100%", maxWidth: 340 }}>
-        <div style={{ color: COLORS.textPrimary, fontFamily: FONT_MONO, fontSize: 14, fontWeight: 700 }}>ANTHROPIC API KEY</div>
+        <div style={smallLabelStyle}>Choose a provider</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          {Object.keys(PROVIDER_INFO).map((key) => (
+            <button
+              key={key}
+              onClick={() => selectProvider(key)}
+              style={{
+                flex: 1,
+                padding: "8px 6px",
+                borderRadius: 4,
+                border: `1px solid ${provider === key ? COLORS.purple : COLORS.cardBorder}`,
+                backgroundColor: provider === key ? COLORS.purple : "transparent",
+                color: provider === key ? "#0a0a0a" : COLORS.textPrimary,
+                fontFamily: FONT_MONO,
+                fontSize: 12,
+                cursor: "pointer",
+              }}
+            >
+              {PROVIDER_INFO[key].label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 3 }}>
+          {info.capabilities.map((c) => (
+            <div key={c.text} style={{ color: c.ok ? COLORS.textMuted : COLORS.red, fontFamily: FONT_MONO, fontSize: 11 }}>
+              {c.ok ? "✓" : "✕"} {c.text}
+            </div>
+          ))}
+        </div>
+
+        <div style={{ color: COLORS.textPrimary, fontFamily: FONT_MONO, fontSize: 14, fontWeight: 700, marginTop: 16 }}>
+          {info.label.toUpperCase()} API KEY
+        </div>
         <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, marginTop: 8 }}>
-          Required for card scanning, voice transcription, and post generation. Stored in session memory only — never saved.
+          Stored in session memory only — never saved.
         </div>
         <input
           type="password"
           value={value}
           onChange={(e) => setValue(e.target.value)}
-          placeholder="sk-ant-..."
+          placeholder={info.keyPlaceholder}
           style={{
             width: "100%",
             marginTop: 14,
@@ -1213,7 +1422,7 @@ function ApiKeyModal({ onSave, onClose, canClose }) {
           Save for session
         </button>
         <a
-          href="https://console.anthropic.com"
+          href={info.getKeyUrl}
           target="_blank"
           rel="noreferrer"
           style={{ display: "block", textAlign: "center", marginTop: 12, color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, textDecoration: "none" }}
@@ -1234,7 +1443,7 @@ function ApiKeyModal({ onSave, onClose, canClose }) {
 }
 
 // ── Global header + tab bar ──────────────────────────────────
-function GlobalHeader({ hasKey, onKeyTap }) {
+function GlobalHeader({ hasKey, provider, onKeyTap }) {
   return (
     <div
       style={{
@@ -1259,8 +1468,12 @@ function GlobalHeader({ hasKey, onKeyTap }) {
       <div style={{ color: COLORS.purple, fontFamily: FONT_DISPLAY, fontSize: 14, fontWeight: 700 }}>
         {USER_CONFIG.event} '{USER_CONFIG.eventYear.slice(-2)}
       </div>
-      <button onClick={onKeyTap} style={{ background: "none", border: "none", fontSize: 16, cursor: "pointer" }}>
-        {hasKey ? "🔑" : "⚠️"}
+      <button
+        onClick={onKeyTap}
+        style={{ background: "none", border: "none", display: "flex", alignItems: "center", gap: 4, cursor: "pointer", color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 10 }}
+      >
+        <span style={{ fontSize: 16 }}>{hasKey ? "🔑" : "⚠️"}</span>
+        {hasKey && <span>{PROVIDER_INFO[provider].label}</span>}
       </button>
     </div>
   );
@@ -1316,11 +1529,20 @@ export default function App() {
 
   const [activeTab, setActiveTab] = useState("scan");
   const [apiKey, setApiKey] = useState("");
+  const [provider, setProvider] = useState("anthropic");
+  const [openrouterModels, setOpenrouterModels] = useState({ text: [], vision: [] });
   const [keyModalOpen, setKeyModalOpen] = useState(true);
   const [contacts, setContacts] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [posts, setPosts] = useState([]);
   const [presetContact, setPresetContact] = useState(null);
+
+  useEffect(() => {
+    if (provider !== "openrouter") return;
+    if (openrouterModels.text.length > 0 || openrouterModels.vision.length > 0) return;
+    fetchFreeOpenRouterModels().then(setOpenrouterModels);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [provider]);
 
   const addContact = (contact) => setContacts((prev) => [...prev, contact]);
   const updateContact = (updated) => setContacts((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
@@ -1346,16 +1568,18 @@ export default function App() {
         paddingBottom: 70,
       }}
     >
-      <GlobalHeader hasKey={!!apiKey} onKeyTap={() => setKeyModalOpen(true)} />
+      <GlobalHeader hasKey={!!apiKey} provider={provider} onKeyTap={() => setKeyModalOpen(true)} />
 
-      {activeTab === "scan" && <ScanTab apiKey={apiKey} onSaveContact={addContact} />}
-      {activeTab === "sessions" && <SessionsTab apiKey={apiKey} sessions={sessions} onSaveSession={addSession} />}
+      {activeTab === "scan" && <ScanTab apiKey={apiKey} provider={provider} openrouterModels={openrouterModels} onSaveContact={addContact} />}
+      {activeTab === "sessions" && <SessionsTab apiKey={apiKey} provider={provider} sessions={sessions} onSaveSession={addSession} />}
       {activeTab === "contacts" && (
-        <ContactsTab apiKey={apiKey} contacts={contacts} onUpdateContact={updateContact} onGeneratePost={goToPostsWithContact} />
+        <ContactsTab apiKey={apiKey} provider={provider} contacts={contacts} onUpdateContact={updateContact} onGeneratePost={goToPostsWithContact} />
       )}
       {activeTab === "posts" && (
         <PostsTab
           apiKey={apiKey}
+          provider={provider}
+          openrouterModels={openrouterModels}
           contacts={contacts}
           sessions={sessions}
           posts={posts}
@@ -1370,6 +1594,8 @@ export default function App() {
 
       {keyModalOpen && (
         <ApiKeyModal
+          provider={provider}
+          onProviderChange={setProvider}
           canClose={!!apiKey}
           onSave={(key) => {
             setApiKey(key);
