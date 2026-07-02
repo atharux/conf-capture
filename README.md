@@ -8,13 +8,13 @@ I built this for myself for conferences — I kept meeting people and sitting in
 
 ## What it does
 
-- **Scan** — point your camera at a business card (or upload a photo), get the fields parsed automatically: name, title, company, email, LinkedIn, phone.
-- **Sessions** — log a talk you just watched. Record a voice note or type it — speaker, key insight, a quote or stat, an action item, a 1–5 rating.
-- **Contacts** — everyone you've scanned, with room to add voice notes about follow-ups and how strong the connection felt.
-- **Posts** — turn a contact, a session, or a raw idea into a LinkedIn post in your own writing voice, generated from a config block you edit once.
-- **About** — who built it, how to fork it, a live QR code to the deployed app.
+- **Scan** — point your camera at a business card (or upload a photo, or type it in by hand), get the fields parsed automatically: name, title, company, email, LinkedIn, phone.
+- **Sessions** — log a talk you just watched. Hit **Record Full Talk** and walk away — it records in the background in short rolling segments and extracts session fields from the whole thing when you stop, so one bad segment doesn't cost you the talk. Or record a quick voice note, or just type it. Attach photos (of a slide, the stage, whatever) to any saved session, and delete it individually if you don't want it.
+- **Contacts** — everyone you've scanned, with room to add voice notes about follow-ups and how strong the connection felt. Delete any contact individually.
+- **Posts** — write your own post directly, always available with zero AI. Optionally record an idea or ask AI to generate/polish what you've written, using a contact, a session, or a general reflection as context — in your own writing voice from a config block you edit once.
+- **About** — who built it, how to fork it, a live QR code to the deployed app, and where to clear your data.
 
-No backend, no database, no login, no tracking. Everything — your API key, and every card/session/contact/post you capture — saves to this browser's local storage, so closing the tab or reopening the app days later doesn't lose anything. It's all local to your device: nothing syncs, nothing leaves the browser except calls to whichever AI provider you choose. Export contacts as a `.vcf` (drops straight into your phone's address book) and sessions/posts as `.md` from each tab, or clear everything at once from the About tab.
+No backend, no database, no login, no tracking. Everything — your API key, and every card/session/contact/post you capture — saves to this browser's local storage, so closing the tab or reopening the app days later doesn't lose anything. It's all local to your device: nothing syncs, nothing leaves the browser except calls to whichever AI provider you choose. Export contacts as a `.vcf` (drops straight into your phone's address book) and sessions/posts as `.md` from each tab, or clear everything at once from the About tab. It's also installable — add it to your homescreen from the browser's share/install menu and it opens like a real app.
 
 ## Using it
 
@@ -33,9 +33,6 @@ const USER_CONFIG = {
   name: "...",
   brand: "...",
   role: "...",
-  event: "...",
-  eventLocation: "...",
-  eventYear: "...",
   website: "...",
   hiringUrl: "...",
   githubRepo: "...",
@@ -43,6 +40,8 @@ const USER_CONFIG = {
   writingStyle: `...`, // how you want generated posts to sound
 };
 ```
+
+Want your own icon on the homescreen instead of the default mark? Swap `public/icon-192.png`, `public/icon-512.png`, `public/icon-maskable-512.png`, and `public/apple-touch-icon.png`, and update `public/manifest.json`'s `name`/`short_name`.
 
 Edit that, nothing else needs to change. The rest of the file reads from it — nothing else is hardcoded to me.
 

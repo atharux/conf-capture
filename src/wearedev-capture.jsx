@@ -77,6 +77,12 @@ const CONTACT_VOICE_PARSE_PROMPT =
 const POST_IDEA_PROMPT =
   'The user has recorded a rough idea for a LinkedIn post. Extract and return ONLY a JSON object with no preamble, no markdown, no backticks. Fields: rawIdea (string — their core point or observation, cleaned up but not polished), suggestedPostType (string — one of: "Met someone interesting", "Workshop takeaway", "Hot take / observation", "Day recap").';
 
+const SPEAKER_CHUNK_TRANSCRIBE_PROMPT =
+  "Transcribe this audio segment verbatim. Return ONLY the spoken words as plain text — no preamble, no markdown, no timestamps, no speaker labels. If no speech is audible, return an empty string.";
+
+const SPEAKER_NOTES_EXTRACT_SYSTEM_PROMPT =
+  'The user is giving you a transcript of a conference talk they recorded. Extract and return ONLY a JSON object with no preamble, no markdown, no backticks. Fields: sessionTitle (string — infer from content if not stated, else empty string), speaker (string — infer if mentioned, else empty string), keyInsight (string — the single most useful point made), quoteStat (string — a notable quote or statistic mentioned, else empty string), actionItem (string — something actionable a listener could do based on this talk, else empty string), rating (number 1-5, infer overall quality/usefulness from the content, default 3).';
+
 function buildPostGenerationPrompt(contextJSON, postType) {
   return `You are writing or polishing a LinkedIn post for ${USER_CONFIG.name}, a ${USER_CONFIG.role}. Their brand is ${USER_CONFIG.brand}. Writing style: ${USER_CONFIG.writingStyle}. Write in first person. If the user gives you a draft, refine and complete it in their voice rather than replacing it with something unrelated. Return only the post text. No preamble. No explanation.
 
@@ -147,6 +153,39 @@ function blobToBase64(blob) {
     };
     reader.onerror = reject;
     reader.readAsDataURL(blob);
+  });
+}
+
+// Downscales + compresses before storing — localStorage has a ~5-10MB total
+// budget, and a handful of raw phone photos would blow through that instantly.
+function compressImageFile(file, maxDimension = 800, quality = 0.6) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      let { width, height } = img;
+      if (width > maxDimension || height > maxDimension) {
+        if (width > height) {
+          height = Math.round((height * maxDimension) / width);
+          width = maxDimension;
+        } else {
+          width = Math.round((width * maxDimension) / height);
+          height = maxDimension;
+        }
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, width, height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = (e) => {
+      URL.revokeObjectURL(url);
+      reject(e);
+    };
+    img.src = url;
   });
 }
 
@@ -295,6 +334,28 @@ async function generateFromText({ provider, apiKey, openrouterModels, systemProm
   return { text: extractResponseText(result), meta: extractMeta(result) };
 }
 
+// One chunk of a longer talk recording — audio-only, Anthropic-only (same
+// constraint as MicCapture). Kept separate from generateFromImage/Text since
+// it's a narrower, single-purpose call with no JSON parsing expected back.
+async function transcribeAudioChunk(apiKey, blob, mimeType) {
+  const base64Data = await blobToBase64(blob);
+  const body = {
+    model: ANTHROPIC_MODEL,
+    max_tokens: MAX_TOKENS,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "document", source: { type: "base64", media_type: mimeType, data: base64Data } },
+          { type: "text", text: SPEAKER_CHUNK_TRANSCRIBE_PROMPT },
+        ],
+      },
+    ],
+  };
+  const result = await callAnthropic(apiKey, body);
+  return extractResponseText(result).trim();
+}
+
 function tryParseJSON(text) {
   try {
     const cleaned = text.trim().replace(/^```(json)?/i, "").replace(/```$/, "").trim();
@@ -360,8 +421,11 @@ function loadStoredData() {
 function saveStoredData(data) {
   try {
     localStorage.setItem(DATA_STORAGE_KEY, JSON.stringify(data));
+    return true;
   } catch (e) {
-    // no-op — storage unavailable or full, in-memory state still works this session
+    // storage unavailable or full — in-memory state still works this session,
+    // but the caller should warn the user their changes aren't persisting
+    return false;
   }
 }
 
@@ -768,6 +832,244 @@ function MicCapture({ apiKey, provider, label, parsePrompt, onTranscript }) {
   );
 }
 
+function formatElapsed(totalSeconds) {
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+// Records a full talk hands-off: repeated short start/stop cycles (not
+// MediaRecorder's timeslice, which doesn't reliably produce independently
+// decodable chunks across browsers) so each segment is a complete, valid
+// audio file. Each segment is transcribed as it completes; one failed segment
+// only costs that segment, not the whole talk. On stop, the full transcript
+// is run through one extraction pass to fill in the session fields.
+const SPEAKER_CHUNK_MS = 60000;
+
+function SpeakerRecorder({ apiKey, provider, openrouterModels, onNotes }) {
+  const [status, setStatus] = useState("idle"); // idle | recording | extracting | done | error | denied
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [chunkCount, setChunkCount] = useState(0);
+  const [failedChunks, setFailedChunks] = useState(0);
+  const [errorMsg, setErrorMsg] = useState("");
+  const [meta, setMeta] = useState(null);
+  const streamRef = useRef(null);
+  const recorderRef = useRef(null);
+  const chunkTimerRef = useRef(null);
+  const elapsedTimerRef = useRef(null);
+  const transcriptRef = useRef([]);
+  const recordingRef = useRef(false);
+
+  const stopTimers = () => {
+    if (chunkTimerRef.current) clearTimeout(chunkTimerRef.current);
+    if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current);
+  };
+
+  const releaseStream = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      recordingRef.current = false;
+      stopTimers();
+      if (recorderRef.current && recorderRef.current.state !== "inactive") {
+        try {
+          recorderRef.current.stop();
+        } catch (e) {
+          // no-op
+        }
+      }
+      releaseStream();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (!apiKey) {
+    return <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13 }}>Add an API key to record a full talk.</div>;
+  }
+  if (provider === "openrouter") {
+    return <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13 }}>Recording full talks needs an Anthropic key — record a quick note instead.</div>;
+  }
+
+  const finalizeRecording = async () => {
+    releaseStream();
+    const fullTranscript = transcriptRef.current.join("\n\n").trim();
+    if (!fullTranscript) {
+      setStatus("error");
+      setErrorMsg("No speech was transcribed — try again, or record a quick note instead.");
+      return;
+    }
+    setStatus("extracting");
+    try {
+      const { text, meta: responseMeta } = await generateFromText({
+        provider,
+        apiKey,
+        openrouterModels,
+        systemPrompt: SPEAKER_NOTES_EXTRACT_SYSTEM_PROMPT,
+        userText: fullTranscript,
+      });
+      const parsed = tryParseJSON(text);
+      onNotes(parsed.ok ? parsed.data : { keyInsight: fullTranscript.slice(0, 800) });
+      setMeta(responseMeta);
+      setStatus("done");
+    } catch (err) {
+      setErrorMsg(err.message || "Couldn't extract notes from the recording.");
+      setStatus("error");
+    }
+  };
+
+  const recordOneChunk = () => {
+    if (!recordingRef.current || !streamRef.current) return;
+    const recorder = new MediaRecorder(streamRef.current);
+    recorderRef.current = recorder;
+    const localChunks = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) localChunks.push(e.data);
+    };
+    recorder.onstop = async () => {
+      const mimeType = ((recorder.mimeType || "audio/webm").split(";")[0]) || "audio/webm";
+      const blob = new Blob(localChunks, { type: mimeType });
+      setChunkCount((n) => n + 1);
+      try {
+        const text = await transcribeAudioChunk(apiKey, blob, mimeType);
+        if (text) transcriptRef.current.push(text);
+      } catch (err) {
+        setFailedChunks((n) => n + 1);
+      }
+      if (recordingRef.current) {
+        recordOneChunk();
+      } else {
+        finalizeRecording();
+      }
+    };
+    recorder.start();
+    chunkTimerRef.current = setTimeout(() => {
+      if (recorder.state !== "inactive") recorder.stop();
+    }, SPEAKER_CHUNK_MS);
+  };
+
+  const startRecording = async () => {
+    setErrorMsg("");
+    setMeta(null);
+    setChunkCount(0);
+    setFailedChunks(0);
+    setElapsedSeconds(0);
+    transcriptRef.current = [];
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      recordingRef.current = true;
+      setStatus("recording");
+      elapsedTimerRef.current = setInterval(() => setElapsedSeconds((s) => s + 1), 1000);
+      recordOneChunk();
+    } catch (err) {
+      setStatus("denied");
+    }
+  };
+
+  const stopRecording = () => {
+    recordingRef.current = false;
+    stopTimers();
+    if (recorderRef.current && recorderRef.current.state !== "inactive") {
+      recorderRef.current.stop(); // triggers onstop → transcribes last chunk → finalizeRecording()
+    } else {
+      finalizeRecording();
+    }
+  };
+
+  const reset = () => {
+    setStatus("idle");
+    setErrorMsg("");
+    setMeta(null);
+  };
+
+  if (status === "denied") {
+    return <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13 }}>Mic unavailable — record a quick note or fill in the fields manually.</div>;
+  }
+
+  return (
+    <div style={{ marginBottom: 4 }}>
+      {(status === "idle" || status === "error") && (
+        <button
+          onClick={startRecording}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "10px 16px",
+            borderRadius: 4,
+            fontFamily: FONT_MONO,
+            fontSize: 13,
+            cursor: "pointer",
+            backgroundColor: COLORS.card,
+            color: COLORS.textPrimary,
+            border: `1px solid ${COLORS.cardBorder}`,
+            width: "100%",
+            justifyContent: "center",
+          }}
+        >
+          <span>🎙</span>
+          <span>Record Full Talk</span>
+        </button>
+      )}
+
+      {status === "recording" && (
+        <button
+          onClick={stopRecording}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "10px 16px",
+            borderRadius: 4,
+            fontFamily: FONT_MONO,
+            fontSize: 13,
+            cursor: "pointer",
+            backgroundColor: COLORS.red,
+            color: COLORS.textPrimary,
+            border: `1px solid ${COLORS.red}`,
+            animation: "mic-pulse 1.2s infinite",
+            width: "100%",
+            justifyContent: "center",
+          }}
+        >
+          <span>●</span>
+          <span>Recording talk... {formatElapsed(elapsedSeconds)} — tap to stop</span>
+        </button>
+      )}
+
+      {status === "recording" && (
+        <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 11, marginTop: 4 }}>
+          {chunkCount} segment{chunkCount === 1 ? "" : "s"} processed{failedChunks > 0 ? ` · ${failedChunks} failed` : ""}
+        </div>
+      )}
+
+      {status === "extracting" && (
+        <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13, marginTop: 4 }}>Extracting notes from the recording...</div>
+      )}
+
+      {errorMsg && <div style={{ color: COLORS.red, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6 }}>{errorMsg}</div>}
+
+      {status === "done" && (
+        <>
+          <div style={{ color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6 }}>Notes extracted below — edit anything before saving.</div>
+          <ModelMeta meta={meta} />
+          <button
+            onClick={reset}
+            style={{ background: "none", border: "none", color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6, cursor: "pointer", padding: 0 }}
+          >
+            Record another
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── TAB 1 — Scan ─────────────────────────────────────────────
 function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
   const videoRef = useRef(null);
@@ -1057,34 +1359,113 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
 }
 
 // ── TAB 2 — Sessions ─────────────────────────────────────────
-function SessionCard({ session, expanded, onToggle }) {
+function SessionCard({ session, expanded, onToggle, onUpdateSession, onDelete }) {
+  const fileInputRef = useRef(null);
+  const [busy, setBusy] = useState(false);
+
+  const handleAddPhoto = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy(true);
+    try {
+      const dataUrl = await compressImageFile(file);
+      onUpdateSession({ ...session, photos: [...(session.photos || []), dataUrl] });
+    } catch (err) {
+      // best effort — a failed photo add just doesn't attach anything
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removePhoto = (index) => {
+    onUpdateSession({ ...session, photos: (session.photos || []).filter((_, i) => i !== index) });
+  };
+
+  const handleDelete = () => {
+    if (window.confirm(`Delete "${session.sessionTitle || "this session"}"? This can't be undone.`)) {
+      onDelete(session.id);
+    }
+  };
+
   return (
-    <div onClick={onToggle} style={{ padding: 14, backgroundColor: COLORS.card, border: `1px solid ${COLORS.cardBorder}`, borderRadius: 4, cursor: "pointer" }}>
-      <div style={{ color: COLORS.textPrimary, fontFamily: FONT_DISPLAY, fontSize: 15, fontWeight: 700 }}>{session.sessionTitle || "Untitled session"}</div>
-      <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, marginTop: 2 }}>
-        {[session.speaker, session.day, session.timeSlot].filter(Boolean).join(" · ")}
-      </div>
-      <div style={{ marginTop: 4, fontSize: 13 }}>
-        <span style={{ color: COLORS.purple }}>{"★".repeat(session.rating || 0)}</span>
-        <span style={{ color: COLORS.cardBorder }}>{"★".repeat(5 - (session.rating || 0))}</span>
-      </div>
-      {!expanded && session.keyInsight && (
-        <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {session.keyInsight}
+    <div style={{ padding: 14, backgroundColor: COLORS.card, border: `1px solid ${COLORS.cardBorder}`, borderRadius: 4 }}>
+      <div onClick={onToggle} style={{ cursor: "pointer" }}>
+        <div style={{ color: COLORS.textPrimary, fontFamily: FONT_DISPLAY, fontSize: 15, fontWeight: 700 }}>{session.sessionTitle || "Untitled session"}</div>
+        <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, marginTop: 2 }}>
+          {[session.speaker, session.day, session.timeSlot].filter(Boolean).join(" · ")}
         </div>
-      )}
+        <div style={{ marginTop: 4, fontSize: 13 }}>
+          <span style={{ color: COLORS.purple }}>{"★".repeat(session.rating || 0)}</span>
+          <span style={{ color: COLORS.cardBorder }}>{"★".repeat(5 - (session.rating || 0))}</span>
+        </div>
+        {!expanded && session.keyInsight && (
+          <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {session.keyInsight}
+          </div>
+        )}
+      </div>
+
       {expanded && (
         <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
           {session.keyInsight && <DetailRow label="Key insight" value={session.keyInsight} />}
           {session.quoteStat && <DetailRow label="Quote / stat" value={session.quoteStat} />}
           {session.actionItem && <DetailRow label="Action item" value={session.actionItem} />}
+
+          {session.photos && session.photos.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4 }}>
+              {session.photos.map((src, i) => (
+                <div key={i} style={{ position: "relative" }}>
+                  <img src={src} alt="" style={{ width: 72, height: 72, objectFit: "cover", borderRadius: 4, border: `1px solid ${COLORS.cardBorder}` }} />
+                  <button
+                    onClick={() => removePhoto(i)}
+                    aria-label="Remove photo"
+                    style={{
+                      position: "absolute",
+                      top: -6,
+                      right: -6,
+                      width: 20,
+                      height: 20,
+                      borderRadius: "50%",
+                      backgroundColor: COLORS.red,
+                      color: "#0a0a0a",
+                      border: "none",
+                      fontSize: 12,
+                      lineHeight: "20px",
+                      cursor: "pointer",
+                      padding: 0,
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+            <button
+              onClick={() => fileInputRef.current && fileInputRef.current.click()}
+              disabled={busy}
+              style={{ ...primaryButtonStyle(COLORS.teal), padding: "8px 14px", flex: "none", opacity: busy ? 0.6 : 1 }}
+            >
+              {busy ? "Adding..." : "Add Photo"}
+            </button>
+            <input ref={fileInputRef} type="file" accept="image/*" capture="environment" onChange={handleAddPhoto} style={{ display: "none" }} />
+            <button
+              onClick={handleDelete}
+              style={{ background: "none", border: `1px solid ${COLORS.red}`, borderRadius: 4, color: COLORS.red, fontFamily: FONT_MONO, fontSize: 12, padding: "8px 14px", cursor: "pointer" }}
+            >
+              Delete
+            </button>
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function SessionsTab({ apiKey, provider, sessions, onSaveSession }) {
+function SessionsTab({ apiKey, provider, openrouterModels, sessions, onSaveSession, onUpdateSession, onDeleteSession }) {
   const [formOpen, setFormOpen] = useState(false);
   const emptyForm = { sessionTitle: "", speaker: "", day: "", timeSlot: "", keyInsight: "", quoteStat: "", actionItem: "", rating: 3 };
   const [form, setForm] = useState(emptyForm);
@@ -1134,7 +1515,8 @@ function SessionsTab({ apiKey, provider, sessions, onSaveSession }) {
 
       {formOpen && (
         <div style={{ marginTop: 16, padding: 14, backgroundColor: COLORS.card, border: `1px solid ${COLORS.cardBorder}`, borderRadius: 4, display: "flex", flexDirection: "column", gap: 12 }}>
-          <MicCapture apiKey={apiKey} provider={provider} label="Record Session Note" parsePrompt={SESSION_PARSE_PROMPT} onTranscript={handleTranscript} />
+          <SpeakerRecorder apiKey={apiKey} provider={provider} openrouterModels={openrouterModels} onNotes={handleTranscript} />
+          <MicCapture apiKey={apiKey} provider={provider} label="Record Session Note (quick)" parsePrompt={SESSION_PARSE_PROMPT} onTranscript={handleTranscript} />
 
           <LabeledInput label="Session title" value={form.sessionTitle} onChange={(v) => updateField("sessionTitle", v)} />
           <LabeledInput label="Speaker" value={form.speaker} onChange={(v) => updateField("speaker", v)} />
@@ -1190,7 +1572,14 @@ function SessionsTab({ apiKey, provider, sessions, onSaveSession }) {
 
       <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
         {sessions.slice().reverse().map((s) => (
-          <SessionCard key={s.id} session={s} expanded={expandedId === s.id} onToggle={() => setExpandedId(expandedId === s.id ? null : s.id)} />
+          <SessionCard
+            key={s.id}
+            session={s}
+            expanded={expandedId === s.id}
+            onToggle={() => setExpandedId(expandedId === s.id ? null : s.id)}
+            onUpdateSession={onUpdateSession}
+            onDelete={onDeleteSession}
+          />
         ))}
         {sessions.length === 0 && <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13 }}>No sessions logged yet.</div>}
       </div>
@@ -1199,7 +1588,7 @@ function SessionsTab({ apiKey, provider, sessions, onSaveSession }) {
 }
 
 // ── TAB 3 — Contacts ─────────────────────────────────────────
-function ContactsTab({ apiKey, provider, contacts, onUpdateContact, onGeneratePost }) {
+function ContactsTab({ apiKey, provider, contacts, onUpdateContact, onDeleteContact, onGeneratePost }) {
   const [expandedId, setExpandedId] = useState(null);
   const [voiceOpenId, setVoiceOpenId] = useState(null);
 
@@ -1212,6 +1601,12 @@ function ContactsTab({ apiKey, provider, contacts, onUpdateContact, onGeneratePo
     };
     onUpdateContact(updated);
     setVoiceOpenId(null);
+  };
+
+  const handleDelete = (contact) => {
+    if (window.confirm(`Delete ${contact.name || "this contact"}? This can't be undone.`)) {
+      onDeleteContact(contact.id);
+    }
   };
 
   return (
@@ -1258,6 +1653,12 @@ function ContactsTab({ apiKey, provider, contacts, onUpdateContact, onGeneratePo
                     style={{ ...primaryButtonStyle(COLORS.teal), padding: "8px 14px", flex: "none" }}
                   >
                     Add Voice Note
+                  </button>
+                  <button
+                    onClick={() => handleDelete(c)}
+                    style={{ background: "none", border: `1px solid ${COLORS.red}`, borderRadius: 4, color: COLORS.red, fontFamily: FONT_MONO, fontSize: 12, padding: "8px 14px", cursor: "pointer" }}
+                  >
+                    Delete
                   </button>
                 </div>
 
@@ -1879,13 +2280,19 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider]);
 
+  const [storageWarning, setStorageWarning] = useState("");
+
   useEffect(() => {
-    saveStoredData({ contacts, sessions, posts });
+    const ok = saveStoredData({ contacts, sessions, posts });
+    setStorageWarning(ok ? "" : "Storage is full — recent changes may not be saved. Clear old data or remove a photo.");
   }, [contacts, sessions, posts]);
 
   const addContact = (contact) => setContacts((prev) => [...prev, contact]);
   const updateContact = (updated) => setContacts((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+  const deleteContact = (id) => setContacts((prev) => prev.filter((c) => c.id !== id));
   const addSession = (session) => setSessions((prev) => [...prev, session]);
+  const updateSession = (updated) => setSessions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
+  const deleteSession = (id) => setSessions((prev) => prev.filter((s) => s.id !== id));
   const addPost = (post) => setPosts((prev) => [...prev, post]);
   const clearAllData = () => {
     setContacts([]);
@@ -1915,10 +2322,49 @@ export default function App() {
     >
       <GlobalHeader hasKey={!!apiKey} provider={provider} onKeyTap={() => setKeyModalOpen(true)} />
 
+      {storageWarning && (
+        <div
+          style={{
+            position: "fixed",
+            top: 52,
+            left: 0,
+            right: 0,
+            maxWidth: 480,
+            margin: "0 auto",
+            zIndex: 40,
+            backgroundColor: COLORS.red,
+            color: "#0a0a0a",
+            fontFamily: FONT_MONO,
+            fontSize: 11,
+            padding: "6px 16px",
+            textAlign: "center",
+          }}
+        >
+          {storageWarning}
+        </div>
+      )}
+
       {activeTab === "scan" && <ScanTab apiKey={apiKey} provider={provider} openrouterModels={openrouterModels} onSaveContact={addContact} />}
-      {activeTab === "sessions" && <SessionsTab apiKey={apiKey} provider={provider} sessions={sessions} onSaveSession={addSession} />}
+      {activeTab === "sessions" && (
+        <SessionsTab
+          apiKey={apiKey}
+          provider={provider}
+          openrouterModels={openrouterModels}
+          sessions={sessions}
+          onSaveSession={addSession}
+          onUpdateSession={updateSession}
+          onDeleteSession={deleteSession}
+        />
+      )}
       {activeTab === "contacts" && (
-        <ContactsTab apiKey={apiKey} provider={provider} contacts={contacts} onUpdateContact={updateContact} onGeneratePost={goToPostsWithContact} />
+        <ContactsTab
+          apiKey={apiKey}
+          provider={provider}
+          contacts={contacts}
+          onUpdateContact={updateContact}
+          onDeleteContact={deleteContact}
+          onGeneratePost={goToPostsWithContact}
+        />
       )}
       {activeTab === "posts" && (
         <PostsTab
