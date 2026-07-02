@@ -8,9 +8,6 @@ const USER_CONFIG = {
   name: "Athar",
   brand: "Atharux",
   role: "Developer Advocate & UX Engineer",
-  event: "WeAreDevelopers World Congress",
-  eventLocation: "Berlin",
-  eventYear: "2026",
   website: "atharux.com",
   hiringUrl: "hire.atharux.com",
   githubRepo: "https://github.com/atharux/conf-capture",
@@ -81,7 +78,7 @@ const POST_IDEA_PROMPT =
   'The user has recorded a rough idea for a LinkedIn post. Extract and return ONLY a JSON object with no preamble, no markdown, no backticks. Fields: rawIdea (string — their core point or observation, cleaned up but not polished), suggestedPostType (string — one of: "Met someone interesting", "Workshop takeaway", "Hot take / observation", "Day recap").';
 
 function buildPostGenerationPrompt(contextJSON, postType) {
-  return `You are writing a LinkedIn post for ${USER_CONFIG.name}, a ${USER_CONFIG.role} currently at ${USER_CONFIG.event} in ${USER_CONFIG.eventLocation} (${USER_CONFIG.eventYear}). Their brand is ${USER_CONFIG.brand}. Writing style: ${USER_CONFIG.writingStyle}. Write in first person. Return only the post text. No preamble. No explanation.
+  return `You are writing or polishing a LinkedIn post for ${USER_CONFIG.name}, a ${USER_CONFIG.role}. Their brand is ${USER_CONFIG.brand}. Writing style: ${USER_CONFIG.writingStyle}. Write in first person. If the user gives you a draft, refine and complete it in their voice rather than replacing it with something unrelated. Return only the post text. No preamble. No explanation.
 
 Context: ${contextJSON}
 Post type: ${postType}`;
@@ -459,6 +456,14 @@ function MicCapture({ apiKey, provider, label, parsePrompt, onTranscript }) {
     };
   }, []);
 
+  if (!apiKey) {
+    return (
+      <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13 }}>
+        Add an API key to record voice notes — or just type below.
+      </div>
+    );
+  }
+
   if (provider === "openrouter") {
     return (
       <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13 }}>
@@ -627,6 +632,7 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
   const [rawText, setRawText] = useState("");
   const [meta, setMeta] = useState(null);
   const [saveError, setSaveError] = useState("");
+  const [manualEntry, setManualEntry] = useState(false);
   const emptyForm = { name: "", title: "", company: "", email: "", linkedin: "", phone: "", notes: "" };
   const [form, setForm] = useState(emptyForm);
   const [savedFlash, setSavedFlash] = useState(false);
@@ -671,9 +677,18 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
     if (busyRef.current) return; // ignore a second capture/upload while one is still in flight
     busyRef.current = true;
     setThumbnail(URL.createObjectURL(blob));
-    setStatus("parsing");
     setErrorMsg("");
     setRawText("");
+    setMeta(null);
+    if (!apiKey) {
+      // No key set — show the captured photo but skip straight to a blank,
+      // manually-fillable form instead of attempting a call that would just fail.
+      setForm(emptyForm);
+      setStatus("idle");
+      busyRef.current = false;
+      return;
+    }
+    setStatus("parsing");
     try {
       const base64Data = await blobToBase64(blob);
       const { text, meta: responseMeta } = await generateFromImage({
@@ -731,6 +746,19 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
 
   const resetScan = () => {
     setThumbnail(null);
+    setManualEntry(false);
+    setForm(emptyForm);
+    setRawText("");
+    setErrorMsg("");
+    setSaveError("");
+    setMeta(null);
+    setStatus("idle");
+  };
+
+  const enterManually = () => {
+    if (busyRef.current) return;
+    setThumbnail(null);
+    setManualEntry(true);
     setForm(emptyForm);
     setRawText("");
     setErrorMsg("");
@@ -765,7 +793,7 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
           borderRadius: 4,
           overflow: "hidden",
           marginTop: 16,
-          display: thumbnail ? "none" : "block",
+          display: thumbnail || manualEntry ? "none" : "block",
         }}
       >
         {/* Always mounted (never conditionally created) so the stream can attach
@@ -817,12 +845,18 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
 
       <canvas ref={canvasRef} style={{ display: "none" }} />
 
-      <div style={{ marginTop: 12 }}>
+      <div style={{ marginTop: 12, display: "flex", gap: 16 }}>
         <button
           onClick={() => fileInputRef.current && fileInputRef.current.click()}
           style={{ background: "none", border: "none", color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 13, cursor: "pointer", padding: 0 }}
         >
           Upload photo instead
+        </button>
+        <button
+          onClick={enterManually}
+          style={{ background: "none", border: "none", color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 13, cursor: "pointer", padding: 0 }}
+        >
+          Enter manually
         </button>
         <input ref={fileInputRef} type="file" accept="image/*" capture="environment" onChange={handleFileUpload} style={{ display: "none" }} />
       </div>
@@ -831,6 +865,11 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
         <div style={{ marginTop: 16 }}>
           <img src={thumbnail} alt="Captured card" style={{ width: "100%", borderRadius: 4, border: `1px solid ${COLORS.cardBorder}` }} />
           {status === "parsing" && <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 13, marginTop: 8 }}>Parsing card...</div>}
+          {status !== "parsing" && !apiKey && (
+            <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, marginTop: 8 }}>
+              No API key set — fill in the fields below manually, or add a key (top right) to auto-parse.
+            </div>
+          )}
           {status !== "parsing" && <ModelMeta meta={meta} />}
         </div>
       )}
@@ -844,7 +883,7 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
         </div>
       )}
 
-      {thumbnail && status !== "parsing" && (
+      {(thumbnail || manualEntry) && status !== "parsing" && (
         <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 10 }}>
           <LabeledInput label="Name" value={form.name} onChange={(v) => updateField("name", v)} />
           <LabeledInput label="Title" value={form.title} onChange={(v) => updateField("title", v)} />
@@ -1075,12 +1114,13 @@ function ContactsTab({ apiKey, provider, contacts, onUpdateContact, onGeneratePo
 
 // ── TAB 4 — Posts ─────────────────────────────────────────────
 function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, posts, onAddPost, presetContact, clearPreset }) {
+  // postText is the single source of truth — write here directly and Copy needs
+  // nothing else. AI (below) is an optional way to fill or polish it, not a gate.
+  const [postText, setPostText] = useState("");
   const [contextType, setContextType] = useState("general"); // contact | session | general
   const [selectedContactId, setSelectedContactId] = useState("");
   const [selectedSessionId, setSelectedSessionId] = useState("");
   const [postType, setPostType] = useState(POST_TYPES[0]);
-  const [rawIdea, setRawIdea] = useState("");
-  const [generated, setGenerated] = useState("");
   const [status, setStatus] = useState("idle"); // idle | generating | error
   const [errorMsg, setErrorMsg] = useState("");
   const [copyFlash, setCopyFlash] = useState(false);
@@ -1091,7 +1131,6 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
       setContextType("contact");
       setSelectedContactId(String(presetContact.id));
       setPostType("Met someone interesting");
-      setGenerated("");
       setMeta(null);
       setErrorMsg("");
       clearPreset();
@@ -1100,7 +1139,7 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
   }, [presetContact]);
 
   const handleIdeaTranscript = (data) => {
-    if (data.rawIdea) setRawIdea(data.rawIdea);
+    if (data.rawIdea) setPostText((prev) => (prev ? `${prev}\n${data.rawIdea}` : data.rawIdea));
     if (data.suggestedPostType) setPostType(data.suggestedPostType);
   };
 
@@ -1113,11 +1152,11 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
       const s = sessions.find((s) => String(s.id) === selectedSessionId);
       return s ? JSON.stringify(s) : "{}";
     }
-    return JSON.stringify({ rawIdea });
+    return "{}";
   };
 
-  const generatePost = async () => {
-    if (status === "generating") return; // ignore overlapping taps (e.g. rapid Regenerate)
+  const runAI = async () => {
+    if (status === "generating") return; // ignore overlapping taps
     if (contextType === "contact" && !selectedContactId) {
       setErrorMsg("Select a contact first.");
       return;
@@ -1130,10 +1169,12 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
     setErrorMsg("");
     try {
       const systemPrompt = buildPostGenerationPrompt(buildContextJSON(), postType);
-      const userText = rawIdea ? `My rough idea: ${rawIdea}` : "Generate the post now.";
+      const userText = postText.trim()
+        ? `Here's what I've written so far — polish and complete it, don't replace it with something unrelated:\n\n${postText}`
+        : "Generate the post now.";
       const { text: raw, meta: responseMeta } = await generateFromText({ provider, apiKey, openrouterModels, systemPrompt, userText });
       const text = raw.trim();
-      setGenerated(text);
+      setPostText(text);
       setMeta(responseMeta);
       onAddPost({ id: Date.now(), text, postType, contextType });
       setStatus("idle");
@@ -1144,7 +1185,7 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
   };
 
   const copyToClipboard = () => {
-    if (navigator.clipboard) navigator.clipboard.writeText(generated);
+    if (navigator.clipboard) navigator.clipboard.writeText(postText);
     setCopyFlash(true);
     setTimeout(() => setCopyFlash(false), 1500);
   };
@@ -1154,121 +1195,110 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
       <h1 style={headerTextStyle}>POSTS</h1>
 
       <div style={{ marginTop: 16 }}>
-        <MicCapture apiKey={apiKey} provider={provider} label="Record Post Idea" parsePrompt={POST_IDEA_PROMPT} onTranscript={handleIdeaTranscript} />
+        <LabeledTextarea label="Your post" value={postText} onChange={setPostText} rows={8} />
       </div>
 
-      <div style={{ marginTop: 12 }}>
-        <div style={smallLabelStyle}>Context</div>
-        <div style={{ display: "flex", gap: 8 }}>
-          {[
-            { key: "contact", label: "From contact" },
-            { key: "session", label: "From session" },
-            { key: "general", label: "General reflection" },
-          ].map((opt) => (
-            <button
-              key={opt.key}
-              onClick={() => setContextType(opt.key)}
-              style={{
-                flex: 1,
-                padding: "8px 4px",
-                borderRadius: 4,
-                border: `1px solid ${contextType === opt.key ? COLORS.purple : COLORS.cardBorder}`,
-                backgroundColor: contextType === opt.key ? COLORS.purple : "transparent",
-                color: contextType === opt.key ? "#0a0a0a" : COLORS.textPrimary,
-                fontFamily: FONT_MONO,
-                fontSize: 11,
-                cursor: "pointer",
-              }}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
+      <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
+        <button onClick={copyToClipboard} style={primaryButtonStyle(COLORS.teal)}>Copy to clipboard</button>
       </div>
+      {copyFlash && <div style={{ color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6 }}>Copied.</div>}
 
-      {contextType === "contact" && (
-        <select value={selectedContactId} onChange={(e) => setSelectedContactId(e.target.value)} style={selectStyle}>
-          <option value="">Select a contact...</option>
-          {contacts.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name || "Unnamed"}
-            </option>
-          ))}
-        </select>
-      )}
+      {apiKey ? (
+        <>
+          <Divider />
+          <div style={smallLabelStyle}>Use AI (optional)</div>
 
-      {contextType === "session" && (
-        <select value={selectedSessionId} onChange={(e) => setSelectedSessionId(e.target.value)} style={selectStyle}>
-          <option value="">Select a session...</option>
-          {sessions.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.sessionTitle || "Untitled"}
-            </option>
-          ))}
-        </select>
-      )}
+          <MicCapture apiKey={apiKey} provider={provider} label="Record Post Idea" parsePrompt={POST_IDEA_PROMPT} onTranscript={handleIdeaTranscript} />
 
-      <div style={{ marginTop: 12 }}>
-        <div style={smallLabelStyle}>Post type</div>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-          {POST_TYPES.map((t) => (
-            <button
-              key={t}
-              onClick={() => setPostType(t)}
-              style={{
-                padding: "6px 10px",
-                borderRadius: 4,
-                border: `1px solid ${postType === t ? COLORS.orange : COLORS.cardBorder}`,
-                backgroundColor: postType === t ? COLORS.orange : "transparent",
-                color: postType === t ? "#0a0a0a" : COLORS.textPrimary,
-                fontFamily: FONT_MONO,
-                fontSize: 11,
-                cursor: "pointer",
-              }}
-            >
-              {t}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <div style={{ marginTop: 12 }}>
-        <LabeledTextarea label="Your rough idea or talking point" value={rawIdea} onChange={setRawIdea} rows={4} />
-      </div>
-
-      <button onClick={generatePost} disabled={status === "generating"} style={{ ...primaryButtonStyle(COLORS.orange), marginTop: 12, opacity: status === "generating" ? 0.6 : 1 }}>
-        {status === "generating" ? "Generating..." : "Generate Post"}
-      </button>
-
-      {errorMsg && <div style={{ color: COLORS.red, fontFamily: FONT_MONO, fontSize: 13, marginTop: 8 }}>{errorMsg}</div>}
-
-      {generated && (
-        <div style={{ marginTop: 16 }}>
-          <textarea
-            value={generated}
-            onChange={(e) => setGenerated(e.target.value)}
-            rows={8}
-            style={{
-              width: "100%",
-              backgroundColor: COLORS.card,
-              border: `1px solid ${COLORS.cardBorder}`,
-              borderRadius: 4,
-              color: COLORS.textPrimary,
-              fontFamily: FONT_MONO,
-              fontSize: 14,
-              padding: 12,
-              boxSizing: "border-box",
-              resize: "vertical",
-            }}
-          />
-          <div style={{ display: "flex", gap: 10, marginTop: 10 }}>
-            <button onClick={copyToClipboard} style={primaryButtonStyle(COLORS.teal)}>Copy to clipboard</button>
-            <button onClick={generatePost} disabled={status === "generating"} style={{ ...primaryButtonStyle(COLORS.purple), opacity: status === "generating" ? 0.6 : 1 }}>
-              {status === "generating" ? "Generating..." : "Regenerate"}
-            </button>
+          <div style={{ marginTop: 12 }}>
+            <div style={smallLabelStyle}>Context</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {[
+                { key: "contact", label: "From contact" },
+                { key: "session", label: "From session" },
+                { key: "general", label: "General reflection" },
+              ].map((opt) => (
+                <button
+                  key={opt.key}
+                  onClick={() => setContextType(opt.key)}
+                  style={{
+                    flex: 1,
+                    padding: "8px 4px",
+                    borderRadius: 4,
+                    border: `1px solid ${contextType === opt.key ? COLORS.purple : COLORS.cardBorder}`,
+                    backgroundColor: contextType === opt.key ? COLORS.purple : "transparent",
+                    color: contextType === opt.key ? "#0a0a0a" : COLORS.textPrimary,
+                    fontFamily: FONT_MONO,
+                    fontSize: 11,
+                    cursor: "pointer",
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
           </div>
-          {copyFlash && <div style={{ color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, marginTop: 6 }}>Copied.</div>}
+
+          {contextType === "contact" && (
+            <select value={selectedContactId} onChange={(e) => setSelectedContactId(e.target.value)} style={selectStyle}>
+              <option value="">Select a contact...</option>
+              {contacts.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name || "Unnamed"}
+                </option>
+              ))}
+            </select>
+          )}
+
+          {contextType === "session" && (
+            <select value={selectedSessionId} onChange={(e) => setSelectedSessionId(e.target.value)} style={selectStyle}>
+              <option value="">Select a session...</option>
+              {sessions.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.sessionTitle || "Untitled"}
+                </option>
+              ))}
+            </select>
+          )}
+
+          <div style={{ marginTop: 12 }}>
+            <div style={smallLabelStyle}>Post type</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {POST_TYPES.map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setPostType(t)}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 4,
+                    border: `1px solid ${postType === t ? COLORS.orange : COLORS.cardBorder}`,
+                    backgroundColor: postType === t ? COLORS.orange : "transparent",
+                    color: postType === t ? "#0a0a0a" : COLORS.textPrimary,
+                    fontFamily: FONT_MONO,
+                    fontSize: 11,
+                    cursor: "pointer",
+                  }}
+                >
+                  {t}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <button
+            onClick={runAI}
+            disabled={status === "generating"}
+            style={{ ...primaryButtonStyle(COLORS.orange), marginTop: 12, opacity: status === "generating" ? 0.6 : 1 }}
+          >
+            {status === "generating" ? "Generating..." : postText.trim() ? "Polish with AI" : "Generate with AI"}
+          </button>
+
+          {errorMsg && <div style={{ color: COLORS.red, fontFamily: FONT_MONO, fontSize: 13, marginTop: 8 }}>{errorMsg}</div>}
           <ModelMeta meta={meta} />
+        </>
+      ) : (
+        <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, marginTop: 16 }}>
+          Add an API key (top right) to generate or polish posts with AI — or just write your own above.
         </div>
       )}
 
@@ -1416,8 +1446,9 @@ function AboutTab() {
 {`1. clone ${USER_CONFIG.githubRepo}
 2. edit USER_CONFIG at top of wearedev-capture.jsx
 3. open in browser or deploy to Vercel / Netlify
-4. on first load, pick Anthropic (full features) or OpenRouter (free — no voice notes)
-5. bring to your next conference`}
+4. works right away with no key — capture cards, sessions, contacts manually
+5. add a key (top right) any time for AI parsing, voice notes, and post help
+6. bring to your next conference`}
           </pre>
         )}
       </div>
@@ -1432,7 +1463,7 @@ function AboutTab() {
 }
 
 // ── API key modal ────────────────────────────────────────────
-function ApiKeyModal({ provider, onProviderChange, onSave, onClose, canClose }) {
+function ApiKeyModal({ provider, onProviderChange, onSave, onClose, hasKey }) {
   const [value, setValue] = useState("");
   const info = PROVIDER_INFO[provider];
 
@@ -1510,14 +1541,12 @@ function ApiKeyModal({ provider, onProviderChange, onSave, onClose, canClose }) 
         >
           Get a key →
         </a>
-        {canClose && (
-          <button
-            onClick={onClose}
-            style={{ display: "block", margin: "12px auto 0", background: "none", border: "none", color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, cursor: "pointer" }}
-          >
-            Close
-          </button>
-        )}
+        <button
+          onClick={onClose}
+          style={{ display: "block", margin: "12px auto 0", background: "none", border: "none", color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, cursor: "pointer" }}
+        >
+          {hasKey ? "Close" : "Skip for now — capture without AI"}
+        </button>
       </div>
     </div>
   );
@@ -1546,9 +1575,7 @@ function GlobalHeader({ hasKey, provider, onKeyTap }) {
       }}
     >
       <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12 }}>{USER_CONFIG.brand}</div>
-      <div style={{ color: COLORS.purple, fontFamily: FONT_DISPLAY, fontSize: 14, fontWeight: 700 }}>
-        {USER_CONFIG.event} '{USER_CONFIG.eventYear.slice(-2)}
-      </div>
+      <div style={{ color: COLORS.purple, fontFamily: FONT_DISPLAY, fontSize: 14, fontWeight: 700 }}>CONF CAPTURE</div>
       <button
         onClick={onKeyTap}
         style={{ background: "none", border: "none", display: "flex", alignItems: "center", gap: 4, cursor: "pointer", color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 10 }}
@@ -1612,7 +1639,10 @@ export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [provider, setProvider] = useState("anthropic");
   const [openrouterModels, setOpenrouterModels] = useState({ text: [], vision: [] });
-  const [keyModalOpen, setKeyModalOpen] = useState(true);
+  // No forced key prompt on load — capturing cards/sessions/contacts works
+  // without AI at all. The modal only opens when the user taps the key icon
+  // or an AI-powered action that needs one.
+  const [keyModalOpen, setKeyModalOpen] = useState(false);
   const [contacts, setContacts] = useState([]);
   const [sessions, setSessions] = useState([]);
   const [posts, setPosts] = useState([]);
@@ -1677,7 +1707,7 @@ export default function App() {
         <ApiKeyModal
           provider={provider}
           onProviderChange={setProvider}
-          canClose={!!apiKey}
+          hasKey={!!apiKey}
           onSave={(key) => {
             setApiKey(key);
             setKeyModalOpen(false);
