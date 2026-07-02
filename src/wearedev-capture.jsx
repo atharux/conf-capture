@@ -304,6 +304,39 @@ function tryParseJSON(text) {
   }
 }
 
+// The API key persists in localStorage so it survives reopening the app —
+// wrapped in try/catch since storage can be blocked (private browsing, some
+// embedded webviews) and that shouldn't crash the app, just fall back to
+// asking again each time.
+const STORAGE_KEY = "conf-capture:credentials";
+
+function loadStoredCredentials() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return { apiKey: "", provider: "anthropic" };
+    const parsed = JSON.parse(raw);
+    return { apiKey: parsed.apiKey || "", provider: parsed.provider || "anthropic" };
+  } catch (e) {
+    return { apiKey: "", provider: "anthropic" };
+  }
+}
+
+function saveStoredCredentials(apiKey, provider) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ apiKey, provider }));
+  } catch (e) {
+    // no-op — storage unavailable, key just won't persist this session
+  }
+}
+
+function clearStoredCredentials() {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch (e) {
+    // no-op
+  }
+}
+
 function injectGlobalAssets() {
   if (!document.getElementById("wearedev-fonts")) {
     const fontLink = document.createElement("link");
@@ -1463,7 +1496,7 @@ function AboutTab() {
 }
 
 // ── API key modal ────────────────────────────────────────────
-function ApiKeyModal({ provider, onProviderChange, onSave, onClose, hasKey }) {
+function ApiKeyModal({ provider, onProviderChange, onSave, onClose, onForget, hasKey }) {
   const [value, setValue] = useState("");
   const info = PROVIDER_INFO[provider];
 
@@ -1510,7 +1543,7 @@ function ApiKeyModal({ provider, onProviderChange, onSave, onClose, hasKey }) {
           {info.label.toUpperCase()} API KEY
         </div>
         <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, marginTop: 8 }}>
-          Stored in session memory only — never saved.
+          Stored on this device only — never sent anywhere except the provider you choose above.
         </div>
         <input
           type="password"
@@ -1531,7 +1564,7 @@ function ApiKeyModal({ provider, onProviderChange, onSave, onClose, hasKey }) {
           }}
         />
         <button onClick={() => value.trim() && onSave(value.trim())} style={{ ...primaryButtonStyle(COLORS.purple), width: "100%", marginTop: 12 }}>
-          Save for session
+          Save
         </button>
         <a
           href={info.getKeyUrl}
@@ -1541,12 +1574,22 @@ function ApiKeyModal({ provider, onProviderChange, onSave, onClose, hasKey }) {
         >
           Get a key →
         </a>
-        <button
-          onClick={onClose}
-          style={{ display: "block", margin: "12px auto 0", background: "none", border: "none", color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, cursor: "pointer" }}
-        >
-          {hasKey ? "Close" : "Skip for now — capture without AI"}
-        </button>
+        <div style={{ display: "flex", justifyContent: "center", gap: 16, marginTop: 12 }}>
+          <button
+            onClick={onClose}
+            style={{ background: "none", border: "none", color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12, cursor: "pointer", padding: 0 }}
+          >
+            {hasKey ? "Close" : "Skip for now — capture without AI"}
+          </button>
+          {hasKey && (
+            <button
+              onClick={onForget}
+              style={{ background: "none", border: "none", color: COLORS.red, fontFamily: FONT_MONO, fontSize: 12, cursor: "pointer", padding: 0 }}
+            >
+              Forget key
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -1636,8 +1679,9 @@ export default function App() {
   }, []);
 
   const [activeTab, setActiveTab] = useState("scan");
-  const [apiKey, setApiKey] = useState("");
-  const [provider, setProvider] = useState("anthropic");
+  const [stored] = useState(loadStoredCredentials);
+  const [apiKey, setApiKey] = useState(stored.apiKey);
+  const [provider, setProvider] = useState(stored.provider);
   const [openrouterModels, setOpenrouterModels] = useState({ text: [], vision: [] });
   // No forced key prompt on load — capturing cards/sessions/contacts works
   // without AI at all. The modal only opens when the user taps the key icon
@@ -1710,6 +1754,12 @@ export default function App() {
           hasKey={!!apiKey}
           onSave={(key) => {
             setApiKey(key);
+            saveStoredCredentials(key, provider);
+            setKeyModalOpen(false);
+          }}
+          onForget={() => {
+            setApiKey("");
+            clearStoredCredentials();
             setKeyModalOpen(false);
           }}
           onClose={() => setKeyModalOpen(false)}
