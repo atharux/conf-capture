@@ -641,9 +641,14 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
       streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
+      const video = videoRef.current;
+      if (video) {
+        // iOS Safari/Chrome only reliably autoplays inline video when muted and
+        // playsInline are set as real DOM properties, not just JSX attributes.
+        video.muted = true;
+        video.playsInline = true;
+        video.srcObject = stream;
+        await video.play();
       }
       setCameraActive(true);
       setCameraError(false);
@@ -750,58 +755,65 @@ function ScanTab({ apiKey, provider, openrouterModels, onSaveContact }) {
     <div style={{ padding: 16 }}>
       <h1 style={headerTextStyle}>SCAN CARD</h1>
 
-      {!thumbnail && (
-        <div
-          style={{
-            position: "relative",
-            width: "100%",
-            aspectRatio: "3 / 4",
-            backgroundColor: COLORS.card,
-            border: `1px solid ${COLORS.cardBorder}`,
-            borderRadius: 4,
-            overflow: "hidden",
-            marginTop: 16,
-          }}
-        >
-          {cameraActive && !cameraError ? (
-            <video ref={videoRef} muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-          ) : (
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                height: "100%",
-                color: COLORS.textMuted,
-                fontFamily: FONT_MONO,
-                fontSize: 13,
-                padding: 16,
-                textAlign: "center",
-              }}
-            >
-              Camera unavailable
-            </div>
-          )}
-          {cameraActive && !cameraError && (
-            <button
-              onClick={captureFrame}
-              aria-label="Capture"
-              style={{
-                position: "absolute",
-                bottom: 16,
-                left: "50%",
-                transform: "translateX(-50%)",
-                width: 64,
-                height: 64,
-                borderRadius: "50%",
-                backgroundColor: COLORS.purple,
-                border: "none",
-                cursor: "pointer",
-              }}
-            />
-          )}
-        </div>
-      )}
+      <div
+        style={{
+          position: "relative",
+          width: "100%",
+          aspectRatio: "3 / 4",
+          backgroundColor: COLORS.card,
+          border: `1px solid ${COLORS.cardBorder}`,
+          borderRadius: 4,
+          overflow: "hidden",
+          marginTop: 16,
+          display: thumbnail ? "none" : "block",
+        }}
+      >
+        {/* Always mounted (never conditionally created) so the stream can attach
+            to it the moment getUserMedia resolves — a video element that only
+            exists after cameraActive flips true is too late, videoRef.current
+            would still be null when startCamera() tries to use it. */}
+        <video
+          ref={videoRef}
+          muted
+          playsInline
+          style={{ width: "100%", height: "100%", objectFit: "cover", display: cameraActive && !cameraError ? "block" : "none" }}
+        />
+        {(!cameraActive || cameraError) && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              height: "100%",
+              color: COLORS.textMuted,
+              fontFamily: FONT_MONO,
+              fontSize: 13,
+              padding: 16,
+              textAlign: "center",
+            }}
+          >
+            Camera unavailable
+          </div>
+        )}
+        {cameraActive && !cameraError && (
+          <button
+            onClick={captureFrame}
+            aria-label="Capture"
+            style={{
+              position: "absolute",
+              bottom: 16,
+              left: "50%",
+              transform: "translateX(-50%)",
+              width: 64,
+              height: 64,
+              borderRadius: "50%",
+              backgroundColor: COLORS.purple,
+              border: "none",
+              cursor: "pointer",
+            }}
+          />
+        )}
+      </div>
 
       <canvas ref={canvasRef} style={{ display: "none" }} />
 
