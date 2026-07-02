@@ -14,7 +14,7 @@ I built this for myself for conferences — I kept meeting people and sitting in
 - **Posts** — turn a contact, a session, or a raw idea into a LinkedIn post in your own writing voice, generated from a config block you edit once.
 - **About** — who built it, how to fork it, a live QR code to the deployed app.
 
-No backend, no database, no login, no tracking. Captured cards, sessions, contacts, and posts live in React state for the browser tab — close it and that data is gone (nothing to leak, nothing to lose control of). Your API key is the one exception: it's saved to this browser's local storage so you're not re-entering it every time you open the app, and you can clear it anytime from the key modal ("Forget key").
+No backend, no database, no login, no tracking. Everything — your API key, and every card/session/contact/post you capture — saves to this browser's local storage, so closing the tab or reopening the app days later doesn't lose anything. It's all local to your device: nothing syncs, nothing leaves the browser except calls to whichever AI provider you choose. Export contacts as a `.vcf` (drops straight into your phone's address book) and sessions/posts as `.md` from each tab, or clear everything at once from the About tab.
 
 ## Using it
 

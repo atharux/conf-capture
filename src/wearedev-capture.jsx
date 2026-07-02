@@ -337,6 +337,124 @@ function clearStoredCredentials() {
   }
 }
 
+// Captured data (contacts/sessions/posts) persists the same way the key does —
+// otherwise closing the tab loses a whole day's notes, which defeats the point
+// of a capture tool.
+const DATA_STORAGE_KEY = "conf-capture:data";
+
+function loadStoredData() {
+  try {
+    const raw = localStorage.getItem(DATA_STORAGE_KEY);
+    if (!raw) return { contacts: [], sessions: [], posts: [] };
+    const parsed = JSON.parse(raw);
+    return {
+      contacts: Array.isArray(parsed.contacts) ? parsed.contacts : [],
+      sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+      posts: Array.isArray(parsed.posts) ? parsed.posts : [],
+    };
+  } catch (e) {
+    return { contacts: [], sessions: [], posts: [] };
+  }
+}
+
+function saveStoredData(data) {
+  try {
+    localStorage.setItem(DATA_STORAGE_KEY, JSON.stringify(data));
+  } catch (e) {
+    // no-op — storage unavailable or full, in-memory state still works this session
+  }
+}
+
+function clearStoredData() {
+  try {
+    localStorage.removeItem(DATA_STORAGE_KEY);
+  } catch (e) {
+    // no-op
+  }
+}
+
+// ── Export helpers ──────────────────────────────────────────────
+function downloadFile(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function vcardEscape(str) {
+  return String(str || "")
+    .replace(/\\/g, "\\\\")
+    .replace(/,/g, "\\,")
+    .replace(/;/g, "\\;")
+    .replace(/\n/g, "\\n");
+}
+
+function buildVCard(contact) {
+  const lines = ["BEGIN:VCARD", "VERSION:3.0", `FN:${vcardEscape(contact.name || "Unnamed")}`];
+  if (contact.company) lines.push(`ORG:${vcardEscape(contact.company)}`);
+  if (contact.title) lines.push(`TITLE:${vcardEscape(contact.title)}`);
+  if (contact.email) lines.push(`EMAIL:${vcardEscape(contact.email)}`);
+  if (contact.phone) lines.push(`TEL:${vcardEscape(contact.phone)}`);
+  if (contact.linkedin) lines.push(`URL:${vcardEscape(contact.linkedin)}`);
+  const noteParts = [
+    contact.notes,
+    contact.followUp && `Follow up: ${contact.followUp}`,
+    contact.connectionStrength && `Connection: ${contact.connectionStrength}`,
+  ].filter(Boolean);
+  if (noteParts.length) lines.push(`NOTE:${vcardEscape(noteParts.join(" | "))}`);
+  lines.push("END:VCARD");
+  return lines.join("\r\n");
+}
+
+function exportContactsVCard(contacts) {
+  if (contacts.length === 0) return;
+  downloadFile(contacts.map(buildVCard).join("\r\n"), "contacts.vcf", "text/vcard");
+}
+
+function buildSessionsMarkdown(sessions) {
+  const lines = ["# Sessions", ""];
+  sessions.forEach((s) => {
+    lines.push(`## ${s.sessionTitle || "Untitled session"}`);
+    const meta = [s.speaker, s.day, s.timeSlot].filter(Boolean).join(" · ");
+    if (meta) lines.push(`_${meta}_`);
+    if (s.rating) lines.push(`Rating: ${"★".repeat(s.rating)}${"☆".repeat(5 - s.rating)}`);
+    if (s.keyInsight) lines.push(`\n**Key insight:** ${s.keyInsight}`);
+    if (s.quoteStat) lines.push(`\n**Quote/stat:** ${s.quoteStat}`);
+    if (s.actionItem) lines.push(`\n**Action item:** ${s.actionItem}`);
+    lines.push("");
+  });
+  return lines.join("\n");
+}
+
+function exportSessionsMarkdown(sessions) {
+  if (sessions.length === 0) return;
+  downloadFile(buildSessionsMarkdown(sessions), "sessions.md", "text/markdown");
+}
+
+function buildPostsMarkdown(posts) {
+  const lines = ["# Posts", ""];
+  posts
+    .slice()
+    .reverse()
+    .forEach((p, i) => {
+      lines.push(`## Post ${posts.length - i}${p.postType ? ` — ${p.postType}` : ""}`);
+      lines.push("");
+      lines.push(p.text);
+      lines.push("");
+    });
+  return lines.join("\n");
+}
+
+function exportPostsMarkdown(posts) {
+  if (posts.length === 0) return;
+  downloadFile(buildPostsMarkdown(posts), "posts.md", "text/markdown");
+}
+
 function injectGlobalAssets() {
   if (!document.getElementById("wearedev-fonts")) {
     const fontLink = document.createElement("link");
@@ -1061,7 +1179,16 @@ function SessionsTab({ apiKey, provider, sessions, onSaveSession }) {
         </div>
       )}
 
-      <div style={{ marginTop: 20, display: "flex", flexDirection: "column", gap: 10 }}>
+      {sessions.length > 0 && (
+        <button
+          onClick={() => exportSessionsMarkdown(sessions)}
+          style={{ background: "none", border: "none", color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, cursor: "pointer", padding: 0, marginTop: 16 }}
+        >
+          Export .md
+        </button>
+      )}
+
+      <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
         {sessions.slice().reverse().map((s) => (
           <SessionCard key={s.id} session={s} expanded={expandedId === s.id} onToggle={() => setExpandedId(expandedId === s.id ? null : s.id)} />
         ))}
@@ -1089,7 +1216,17 @@ function ContactsTab({ apiKey, provider, contacts, onUpdateContact, onGeneratePo
 
   return (
     <div style={{ padding: 16 }}>
-      <h1 style={headerTextStyle}>CONTACTS</h1>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+        <h1 style={headerTextStyle}>CONTACTS</h1>
+        {contacts.length > 0 && (
+          <button
+            onClick={() => exportContactsVCard(contacts)}
+            style={{ background: "none", border: "none", color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, cursor: "pointer", padding: 0 }}
+          >
+            Export .vcf
+          </button>
+        )}
+      </div>
       <div style={{ marginTop: 16, display: "flex", flexDirection: "column", gap: 10 }}>
         {contacts.slice().reverse().map((c) => (
           <div key={c.id} style={{ padding: 14, backgroundColor: COLORS.card, border: `1px solid ${COLORS.cardBorder}`, borderRadius: 4 }}>
@@ -1337,7 +1474,15 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
 
       {posts.length > 0 && (
         <div style={{ marginTop: 24 }}>
-          <div style={smallLabelStyle}>Post history</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={smallLabelStyle}>Post history</div>
+            <button
+              onClick={() => exportPostsMarkdown(posts)}
+              style={{ background: "none", border: "none", color: COLORS.teal, fontFamily: FONT_MONO, fontSize: 12, cursor: "pointer", padding: 0 }}
+            >
+              Export .md
+            </button>
+          </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
             {posts.slice().reverse().slice(0, 5).map((p) => (
               <div
@@ -1366,8 +1511,15 @@ function PostsTab({ apiKey, provider, openrouterModels, contacts, sessions, post
 }
 
 // ── TAB 5 — About ────────────────────────────────────────────
-function AboutTab() {
+function AboutTab({ onClearData, hasData }) {
   const [setupOpen, setSetupOpen] = useState(false);
+
+  const handleClear = () => {
+    if (window.confirm("Delete all captured contacts, sessions, and posts from this device? This can't be undone.")) {
+      onClearData();
+    }
+  };
+
   return (
     <div style={{ padding: 16 }}>
       <div style={{ color: COLORS.purple, fontFamily: FONT_DISPLAY, fontSize: 26, fontWeight: 800 }}>CONF CAPTURE</div>
@@ -1484,6 +1636,33 @@ function AboutTab() {
 6. bring to your next conference`}
           </pre>
         )}
+      </div>
+
+      <Divider />
+
+      <div>
+        <div style={smallLabelStyle}>Your data</div>
+        <div style={{ color: COLORS.textMuted, fontFamily: FONT_MONO, fontSize: 12 }}>
+          Everything you capture stays on this device — saved to this browser only, never sent anywhere except an AI provider you explicitly choose. Export it or clear it anytime.
+        </div>
+        <button
+          onClick={handleClear}
+          disabled={!hasData}
+          style={{
+            marginTop: 10,
+            padding: "10px 16px",
+            borderRadius: 4,
+            border: `1px solid ${COLORS.red}`,
+            backgroundColor: "transparent",
+            color: hasData ? COLORS.red : COLORS.textMuted,
+            fontFamily: FONT_MONO,
+            fontSize: 13,
+            cursor: hasData ? "pointer" : "default",
+            opacity: hasData ? 1 : 0.5,
+          }}
+        >
+          Clear all data
+        </button>
       </div>
 
       <Divider />
@@ -1687,9 +1866,10 @@ export default function App() {
   // without AI at all. The modal only opens when the user taps the key icon
   // or an AI-powered action that needs one.
   const [keyModalOpen, setKeyModalOpen] = useState(false);
-  const [contacts, setContacts] = useState([]);
-  const [sessions, setSessions] = useState([]);
-  const [posts, setPosts] = useState([]);
+  const [storedData] = useState(loadStoredData);
+  const [contacts, setContacts] = useState(storedData.contacts);
+  const [sessions, setSessions] = useState(storedData.sessions);
+  const [posts, setPosts] = useState(storedData.posts);
   const [presetContact, setPresetContact] = useState(null);
 
   useEffect(() => {
@@ -1699,10 +1879,20 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider]);
 
+  useEffect(() => {
+    saveStoredData({ contacts, sessions, posts });
+  }, [contacts, sessions, posts]);
+
   const addContact = (contact) => setContacts((prev) => [...prev, contact]);
   const updateContact = (updated) => setContacts((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
   const addSession = (session) => setSessions((prev) => [...prev, session]);
   const addPost = (post) => setPosts((prev) => [...prev, post]);
+  const clearAllData = () => {
+    setContacts([]);
+    setSessions([]);
+    setPosts([]);
+    clearStoredData();
+  };
 
   const goToPostsWithContact = (contact) => {
     setPresetContact(contact);
@@ -1743,7 +1933,7 @@ export default function App() {
           clearPreset={() => setPresetContact(null)}
         />
       )}
-      {activeTab === "about" && <AboutTab />}
+      {activeTab === "about" && <AboutTab onClearData={clearAllData} hasData={contacts.length > 0 || sessions.length > 0 || posts.length > 0} />}
 
       <TabBar active={activeTab} onChange={setActiveTab} />
 
